@@ -352,7 +352,7 @@ def show_result(result: dict, current_holdings: dict, layout: str = "stack"):
     a, b, c = st.columns(3)
     a.metric("총자산(₩)", f"₩{total_krw:,.0f}")
     b.metric("현금(₩)", f"₩{cash_krw:,.0f}")
-    c.metric("달러환율(₩/달러)", f"₩{rate:,.2f}")
+    c.metric("달러환율(₩/$)", f"₩{rate:,.2f}")
 
     all_target = merge_holdings(vaa_h, laa_h, odm_h)
 
@@ -440,9 +440,9 @@ def show_result(result: dict, current_holdings: dict, layout: str = "stack"):
 # 사이드바: 모드 + 캐시리셋
 # ======================
 with st.sidebar:
-    st.subheader("모드")
+    st.subheader("_____________________")
     # ✅ 월 리밸런싱이 먼저 뜨도록 (기본값 Month)
-    mode = st.radio("리밸런싱 타입", ["Monthly Rebalancing", "Annual Rebalancing"], index=0)
+    mode = st.radio("Options", ["Monthly Rebalancing", "Annual Rebalancing"], index=0)
 
     if st.button("새로고침"):
         st.cache_data.clear()
@@ -550,16 +550,16 @@ def run_month(prev: dict, krw_add: float, usd_add: float):
 # 화면: Month / Year
 # ======================
 if mode.startswith("Annual Rebalancing"):
-    st.header("Year (Y)")
+    st.header("Annual Rebalancing")
 
-    st.subheader("현재 보유 수량(주)")
+    st.subheader("보유자산")
     amounts = {}
     cols = st.columns(4)
     for i, t in enumerate(INPUT_TICKERS):  # ✅ BIL 제거
         with cols[i % 4]:
             amounts[t] = st.number_input(t, min_value=0, value=0, step=1, key=f"y_amt_{t}")
 
-    st.subheader("현금/추가투자")
+    st.subheader("추가투자금액")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         krw_cash = money_input("현금(₩)", key="y_krw_cash", default=0, allow_decimal=False)
@@ -641,9 +641,9 @@ else:
     st.subheader("추가투자금액")
     c1, c2 = st.columns(2)
     with c1:
-        krw_add = money_input("이번달 추가투자(₩)", key="m_krw_add", default=0, allow_decimal=False)
+        krw_add = money_input("추가투자금액(₩)", key="m_krw_add", default=0, allow_decimal=False)
     with c2:
-        usd_add = money_input("이번달 추가투자($)", key="m_usd_add", default=0, allow_decimal=True)
+        usd_add = money_input("추가투자금액($)", key="m_usd_add", default=0, allow_decimal=True)
 
     if st.button("REBALANCE", type="primary"):
         try:
