@@ -1394,7 +1394,7 @@ elif mode == "Monthly":
 
     prev = json.loads(json.dumps(prev_raw))  # deep copy
 
-    st.subheader("____________")
+    st.subheader("")
     cash_usd = money_input("현금($)", key="m_cash_usd", default=0, allow_decimal=True)
 
     with st.expander("Previous", expanded=False):
