@@ -555,7 +555,7 @@ def run_month(prev: dict, cash_usd: float):
 # ======================
 # 화면: Annual / Monthly
 # ======================
-if mode.startswith("Annual Rebalancing"):
+if mode.startswith("Annual"):
     st.header("Annual Rebalancing")
 
     # ✅ 현금을 "보유자산(주)" 섹션 안에 한 항목으로 포함
