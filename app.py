@@ -175,13 +175,11 @@ def _fred_csv(url: str) -> pd.DataFrame:
         req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urlopen(req, timeout=20) as resp:
             raw = resp.read()
-        # decode (ignore errors)
         text = raw.decode("utf-8", errors="ignore")
         if "<html" in (text or "").lower():
             raise RuntimeError("FRED returned HTML instead of CSV.")
         df = pd.read_csv(io.StringIO(text))
     except Exception:
-        # fallback
         df = pd.read_csv(url)
 
     df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
@@ -716,6 +714,7 @@ BT_BENCHMARKS = {
     "KOSPI (^KS11) [KRW]": ("^KS11", "KRW"),
     "KOSDAQ (^KQ11) [KRW]": ("^KQ11", "KRW"),
 }
+BT_ALL_BENCH_LABEL = "All benchmarks"
 
 
 def bt_parse_start_month(s: str) -> datetime:
@@ -753,14 +752,22 @@ def bt_last_trading_day_on_or_before(d: datetime, trading_index: pd.DatetimeInde
     return trading_index[i]
 
 
-def bt_month_10th_schedule(start_month: datetime, end_date: datetime):
-    cur = start_month.replace(day=10)
-    while cur <= end_date:
-        yield cur
+# ✅ 변경: 리밸런싱 "일자" 선택 가능 (없는 날짜면 말일로 보정)
+def bt_month_day_schedule(start_month: datetime, end_date: datetime, rebalance_day: int):
+    cur = start_month.replace(day=1)
+    while True:
+        y, m = cur.year, cur.month
+        last_day = calendar.monthrange(y, m)[1]
+        day = min(int(rebalance_day), int(last_day))
+        dt = datetime(y, m, day)
+        if dt > end_date:
+            break
+        yield dt
         cur = (pd.Timestamp(cur) + pd.DateOffset(months=1)).to_pydatetime()
 
 
 def bt_is_annual_rebalance(month_idx: int) -> bool:
+    # ✅ 최초 리밸런싱(month_idx=0)부터 12개월 단위로 "전체 포트" 리밸런싱
     return (month_idx % 12) == 0
 
 
@@ -1080,6 +1087,7 @@ def bt_run_backtest(
     monthly_add_usd: float,
     bench_label: str,
     bench_fractional: bool,
+    rebalance_day: int,  # ✅ NEW
 ):
     start_month = bt_parse_start_month(start_month_ym)
     end_date = bt_parse_end_date(end_date_in)
@@ -1087,8 +1095,17 @@ def bt_run_backtest(
     data_start = start_month - timedelta(days=900)
     data_end = end_date + timedelta(days=10)
 
-    bench_ticker, bench_ccy = BT_BENCHMARKS[bench_label]
-    all_tickers = sorted(set(TICKER_LIST + [BT_FX_TICKER, bench_ticker]))
+    # ✅ NEW: All benchmarks 지원 (다운로드 티커에 모두 포함)
+    if bench_label == BT_ALL_BENCH_LABEL:
+        bench_items = list(BT_BENCHMARKS.items())
+        bench_tickers = [v[0] for _, v in bench_items]
+    else:
+        if bench_label not in BT_BENCHMARKS:
+            raise RuntimeError("Unknown benchmark label.")
+        bench_items = [(bench_label, BT_BENCHMARKS[bench_label])]
+        bench_tickers = [BT_BENCHMARKS[bench_label][0]]
+
+    all_tickers = sorted(set(TICKER_LIST + [BT_FX_TICKER] + bench_tickers))
 
     prices_all = bt_download_adj_close(
         tickers=tuple(all_tickers),
@@ -1106,20 +1123,23 @@ def bt_run_backtest(
 
     cal_ticker = "SPY" if "SPY" in prices_raw.columns else prices_raw.columns[0]
     trading_index = prices_raw[cal_ticker].dropna().index
-
     prices_ff = prices_raw.reindex(trading_index).ffill()
 
-    if bench_ticker not in prices_all.columns:
-        raise RuntimeError("Missing benchmark price data.")
-    bench_raw = prices_all[[bench_ticker]].copy()
-    bench_ff = bench_raw.reindex(trading_index).ffill()
+    # ✅ 벤치마크 가격도 같은 trading_index로 정렬/ffill
+    bench_ff_map = {}
+    for label, (ticker, _ccy) in bench_items:
+        if ticker not in prices_all.columns:
+            raise RuntimeError(f"Missing benchmark price data: {ticker}")
+        bench_raw = prices_all[[ticker]].copy()
+        bench_ff_map[label] = bench_raw.reindex(trading_index).ffill()
 
     unrate = bt_unrate_series(
         start_str=data_start.strftime("%Y-%m-%d"),
         end_str=data_end.strftime("%Y-%m-%d"),
     )
 
-    nominal_dates = list(bt_month_10th_schedule(start_month, end_date))
+    # ✅ 변경: 월 10일 고정 -> 사용자가 고른 day
+    nominal_dates = list(bt_month_day_schedule(start_month, end_date, rebalance_day=rebalance_day))
     rebalance_dates = [bt_next_trading_day(nd, trading_index) for nd in nominal_dates]
     if not rebalance_dates:
         raise RuntimeError("No rebalance dates in the given range.")
@@ -1146,9 +1166,11 @@ def bt_run_backtest(
         px_map = {t: bt_px_on_or_before(prices_ff, asof, t) for t in TICKER_LIST}
 
         if annual:
+            # ✅ 전체 포트 기준으로 1/3씩 재배분
             total_after = total_value(asof) + float(add_total_usd)
             budgets = {k: total_after / 3.0 for k in ["VAA", "LAA", "ODM"]}
         else:
+            # ✅ 전략 단위로 자기 포트 + add_each
             add_each = float(add_total_usd) / 3.0
             budgets = {}
             for k in ["VAA", "LAA", "ODM"]:
@@ -1223,31 +1245,58 @@ def bt_run_backtest(
 
     df_log = pd.DataFrame(logs)
 
-    bench_events = bt_simulate_benchmark_events(
-        ticker=bench_ticker,
-        ccy=bench_ccy,
-        rebalance_dates=list(df_log["asof"]),
-        eval_asof=eval_asof,
-        bench_ff=bench_ff,
-        fx_series=fx,
-        initial_total_usd=float(initial_total_usd),
-        monthly_add_krw=float(monthly_add_krw),
-        monthly_add_usd=float(monthly_add_usd),
-        fractional=bool(bench_fractional),
-    )
-    bench_final_usd = float(bench_events[-1][1])
-    bench_ret = (bench_final_usd / total_invested_usd - 1) * 100 if total_invested_usd > 0 else 0.0
-    bench_cagr = bt_compute_twr_cagr(port_events=bench_events, start_date=rebalance_dates[0], end_date=eval_asof)
-
+    # 포트 시계열
     port_points = [(row["asof"], float(row["total_usd"])) for _, row in df_log.iterrows()]
     port_points.append((eval_asof, float(final_usd)))
     port_series = pd.Series([v for _, v in port_points], index=pd.to_datetime([d for d, _ in port_points]))
 
-    bench_points = [(d, post) for (d, _, post) in bench_events[:-1]]
-    bench_points.append((bench_events[-1][0], bench_events[-1][1]))
-    bench_series = pd.Series([v for _, v in bench_points], index=pd.to_datetime([d for d, _ in bench_points]))
+    # ✅ 벤치마크 (단일 or 전체)
+    bench_results = {}
+    bench_series_map = {}
+
+    for label, (ticker, ccy) in bench_items:
+        bench_events = bt_simulate_benchmark_events(
+            ticker=ticker,
+            ccy=ccy,
+            rebalance_dates=list(df_log["asof"]),
+            eval_asof=eval_asof,
+            bench_ff=bench_ff_map[label],
+            fx_series=fx,
+            initial_total_usd=float(initial_total_usd),
+            monthly_add_krw=float(monthly_add_krw),
+            monthly_add_usd=float(monthly_add_usd),
+            fractional=bool(bench_fractional),
+        )
+        bench_final_usd = float(bench_events[-1][1])
+        bench_ret = (bench_final_usd / total_invested_usd - 1) * 100 if total_invested_usd > 0 else 0.0
+        bench_cagr = bt_compute_twr_cagr(port_events=bench_events, start_date=rebalance_dates[0], end_date=eval_asof)
+
+        bench_points = [(d, post) for (d, _, post) in bench_events[:-1]]
+        bench_points.append((bench_events[-1][0], bench_events[-1][1]))
+        bench_series = pd.Series([v for _, v in bench_points], index=pd.to_datetime([d for d, _ in bench_points]))
+
+        bench_results[label] = {
+            "label": label,
+            "ticker": ticker,
+            "ccy": ccy,
+            "fractional": bool(bench_fractional),
+            "final_usd": float(bench_final_usd),
+            "return_pct_vs_total_invested": float(bench_ret),
+            "cagr_twr_pct": float(bench_cagr),
+        }
+        bench_series_map[label] = bench_series
+
+    # 기존 호환(단일 모드일 때는 benchmark/bench_series를 그대로 제공)
+    if bench_label != BT_ALL_BENCH_LABEL:
+        one = bench_results[bench_label]
+        bench_series_single = bench_series_map[bench_label]
+        benchmark_payload = one
+    else:
+        bench_series_single = None
+        benchmark_payload = {"mode": "all", "items": bench_results}
 
     return {
+        "rebalance_day": int(rebalance_day),
         "start_rebalance_asof": rebalance_dates[0],
         "end_eval_asof": eval_asof,
         "initial_usd": float(initial_total_usd),
@@ -1256,18 +1305,13 @@ def bt_run_backtest(
         "final_krw": float(final_krw),
         "return_pct_vs_total_invested": float(ret_total),
         "cagr_twr_pct": float(port_cagr),
-        "benchmark": {
-            "label": bench_label,
-            "ticker": bench_ticker,
-            "ccy": bench_ccy,
-            "fractional": bool(bench_fractional),
-            "final_usd": float(bench_final_usd),
-            "return_pct_vs_total_invested": float(bench_ret),
-            "cagr_twr_pct": float(bench_cagr),
-        },
+        "benchmark_label": bench_label,
+        "benchmark": benchmark_payload,
         "log": df_log,
         "port_series": port_series,
-        "bench_series": bench_series,
+        "bench_series": bench_series_single,         # 단일 모드만
+        "bench_series_map": bench_series_map,         # 단일/전체 모두
+        "bench_results_map": bench_results,           # 단일/전체 모두
     }
 
 
@@ -1396,11 +1440,11 @@ elif mode == "Monthly":
 
 else:
     # ======================
-    # Backtest UI (NEW, English only)
+    # Backtest UI (UPDATED)
     # ======================
     st.header("Backtest")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         bt_start_ym = st.text_input(
             "Start month (YYYY-MM)",
@@ -1414,16 +1458,23 @@ else:
             key="bt_end_in",
         )
     with c3:
-        bt_bench = st.selectbox(
-            "Benchmark",
-            options=list(BT_BENCHMARKS.keys()),
-            index=list(BT_BENCHMARKS.keys()).index(st.session_state.get("bt_bench", "S&P 500 (SPY) [USD]"))
-            if st.session_state.get("bt_bench", "S&P 500 (SPY) [USD]") in BT_BENCHMARKS
-            else 1,
-            key="bt_bench",
-        )
+        # ✅ 변경: All benchmarks 옵션 추가
+        bench_options = [BT_ALL_BENCH_LABEL] + list(BT_BENCHMARKS.keys())
+        default_bench = st.session_state.get("bt_bench", "S&P 500 (SPY) [USD]")
+        idx = bench_options.index(default_bench) if default_bench in bench_options else 1
+        bt_bench = st.selectbox("Benchmark", options=bench_options, index=idx, key="bt_bench")
     with c4:
         bt_fractional = st.selectbox("Benchmark fractional shares", options=["Yes", "No"], index=0, key="bt_fractional")
+    with c5:
+        # ✅ NEW: 리밸런싱일 선택
+        bt_reb_day = st.number_input(
+            "Rebalance day of month (1~31)",
+            min_value=1,
+            max_value=31,
+            value=int(st.session_state.get("bt_reb_day", 10)),
+            step=1,
+            key="bt_reb_day",
+        )
 
     r1, r2, r3, r4 = st.columns(4)
     with r1:
@@ -1449,6 +1500,7 @@ else:
                     monthly_add_usd=float(bt_add_usd),
                     bench_label=bt_bench,
                     bench_fractional=(bt_fractional == "Yes"),
+                    rebalance_day=int(bt_reb_day),
                 )
             st.session_state["backtest_result"] = out
             st.success("Completed")
@@ -1457,32 +1509,58 @@ else:
 
     if "backtest_result" in st.session_state:
         out = st.session_state["backtest_result"]
-        bench = out["benchmark"]
 
-        a, b, c, d = st.columns(4)
-        a.metric("Start rebalance (asof)", str(pd.to_datetime(out["start_rebalance_asof"]).date()))
-        b.metric("End eval (asof)", str(pd.to_datetime(out["end_eval_asof"]).date()))
-        c.metric("Total invested (USD)", f"${out['total_invested_usd']:,.2f}")
-        d.metric("Final (USD)", f"${out['final_usd']:,.2f}")
+        a, b, c, d, e0 = st.columns(5)
+        a.metric("Rebalance day", f"{int(out.get('rebalance_day', 10))}")
+        b.metric("Start rebalance (asof)", str(pd.to_datetime(out["start_rebalance_asof"]).date()))
+        c.metric("End eval (asof)", str(pd.to_datetime(out["end_eval_asof"]).date()))
+        d.metric("Total invested (USD)", f"${out['total_invested_usd']:,.2f}")
+        e0.metric("Final (USD)", f"${out['final_usd']:,.2f}")
 
         e, f, g, h = st.columns(4)
         e.metric("Final (KRW)", f"₩{out['final_krw']:,.0f}")
         f.metric("Return vs invested", f"{out['return_pct_vs_total_invested']:.2f}%")
         g.metric("CAGR (TWR)", f"{out['cagr_twr_pct']:.2f}%")
-        h.metric("Benchmark CAGR (TWR)", f"{bench['cagr_twr_pct']:.2f}%")
+
+        # ✅ 단일/전체 벤치 분기
+        if out.get("benchmark_label") != BT_ALL_BENCH_LABEL:
+            bench = out["benchmark"]
+            h.metric("Benchmark CAGR (TWR)", f"{bench['cagr_twr_pct']:.2f}%")
+        else:
+            # All 모드에서는 Best/Worst로 요약
+            items = out.get("bench_results_map", {})
+            cagr_list = [(k, float(v.get("cagr_twr_pct", 0.0))) for k, v in items.items()]
+            cagr_list.sort(key=lambda x: x[1], reverse=True)
+            if cagr_list:
+                best_k, best_v = cagr_list[0]
+                worst_k, worst_v = cagr_list[-1]
+                h.metric("Bench best/worst CAGR", f"{best_v:.2f}% / {worst_v:.2f}%")
+            else:
+                h.metric("Bench best/worst CAGR", "-")
 
         port_series = out["port_series"].copy()
-        bench_series = out["bench_series"].copy()
 
-        df_chart = pd.concat(
-            [port_series.rename("PORT"), bench_series.rename("BENCH")],
-            axis=1,
-        ).dropna()
+        # ✅ 차트: 단일이면 PORT + BENCH, All이면 PORT + 4 BENCH
+        series_map = {"PORT": port_series}
+
+        if out.get("benchmark_label") != BT_ALL_BENCH_LABEL:
+            bench_series = out["bench_series"].copy() if out.get("bench_series") is not None else None
+            if bench_series is not None:
+                series_map["BENCH"] = bench_series
+        else:
+            for label, s in out.get("bench_series_map", {}).items():
+                # legend 너무 길면 축약(괄호 앞까지만)
+                short = label.split(" (")[0]
+                key = f"BENCH: {short}"
+                series_map[key] = s
+
+        df_chart = pd.concat([v.rename(k) for k, v in series_map.items()], axis=1).dropna()
 
         if not df_chart.empty:
             df_chart = df_chart / df_chart.iloc[0]
             df_chart = df_chart.reset_index().rename(columns={"index": "Date"})
-            df_melt = df_chart.melt(id_vars=["Date"], value_vars=["PORT", "BENCH"], var_name="Series", value_name="Value")
+            value_cols = [c for c in df_chart.columns if c != "Date"]
+            df_melt = df_chart.melt(id_vars=["Date"], value_vars=value_cols, var_name="Series", value_name="Value")
 
             chart = (
                 alt.Chart(df_melt)
@@ -1496,6 +1574,30 @@ else:
                 .properties(height=360)
             )
             st.altair_chart(chart, use_container_width=True)
+
+        # ✅ All 모드일 때 벤치마크 성과표 추가
+        if out.get("benchmark_label") == BT_ALL_BENCH_LABEL:
+            items = out.get("bench_results_map", {})
+            if items:
+                rows = []
+                for label, v in items.items():
+                    rows.append(
+                        {
+                            "Benchmark": label,
+                            "CAGR (TWR) %": float(v.get("cagr_twr_pct", 0.0)),
+                            "Return vs invested %": float(v.get("return_pct_vs_total_invested", 0.0)),
+                            "Final (USD)": float(v.get("final_usd", 0.0)),
+                            "Ticker": v.get("ticker", ""),
+                            "CCY": v.get("ccy", ""),
+                        }
+                    )
+                df_b = pd.DataFrame(rows).sort_values("CAGR (TWR) %", ascending=False, ignore_index=True)
+                with st.expander("Benchmarks (All) - summary", expanded=True):
+                    showb = df_b.copy()
+                    showb["CAGR (TWR) %"] = showb["CAGR (TWR) %"].map(lambda x: f"{x:.2f}%")
+                    showb["Return vs invested %"] = showb["Return vs invested %"].map(lambda x: f"{x:.2f}%")
+                    showb["Final (USD)"] = showb["Final (USD)"].map(lambda x: f"{x:,.2f}")
+                    st.dataframe(showb, use_container_width=True, hide_index=True)
 
         df_log = out["log"].copy()
         with st.expander("Log (last 6)", expanded=True):
@@ -1522,7 +1624,9 @@ else:
             use_container_width=True,
         )
 
+        # ✅ summary JSON: 단일/전체 모두 담기
         summary_payload = {
+            "rebalance_day": int(out.get("rebalance_day", 10)),
             "start_rebalance_asof": str(pd.to_datetime(out["start_rebalance_asof"]).date()),
             "end_eval_asof": str(pd.to_datetime(out["end_eval_asof"]).date()),
             "total_invested_usd": out["total_invested_usd"],
@@ -1530,7 +1634,9 @@ else:
             "final_krw": out["final_krw"],
             "return_pct_vs_total_invested": out["return_pct_vs_total_invested"],
             "cagr_twr_pct": out["cagr_twr_pct"],
-            "benchmark": out["benchmark"],
+            "benchmark_label": out.get("benchmark_label"),
+            "benchmark": out.get("benchmark"),
+            "bench_results_map": out.get("bench_results_map"),
         }
         st.download_button(
             "Download summary (JSON)",
