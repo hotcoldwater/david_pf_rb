@@ -404,7 +404,7 @@ def show_result(result: dict, current_holdings: dict, layout: str = "side"):
     all_target = merge_holdings(vaa_h, laa_h, odm_h)
 
     def render_target_clean():
-        st.subheader("목표 보유(추천안)")
+        st.subheader("목표 보유자산 제안")
         items = [(t, int(q)) for t, q in all_target.items() if int(q) != 0 and t != "BIL"]
         items.sort(key=lambda x: x[0])
 
@@ -418,7 +418,7 @@ def show_result(result: dict, current_holdings: dict, layout: str = "side"):
                 st.metric(t, f"{q}주")
 
     def render_trades_clean():
-        st.subheader("매수/매도(추천안 기준)")
+        st.subheader("BUY/SELL")
         rows = []
         for t in sorted(set(current_holdings.keys()) | set(all_target.keys())):
             if t == "BIL":
@@ -440,22 +440,22 @@ def show_result(result: dict, current_holdings: dict, layout: str = "side"):
 
         left, right = st.columns(2)
         with left:
-            st.markdown("**매도**")
+            st.markdown("**SELL**")
             if not sells:
                 st.write("-")
             else:
                 for t, q in sells:
-                    st.write(f"{t} {q}주 매도")
+                    st.write(f"{t} {q}주 SELL")
         with right:
-            st.markdown("**매수**")
+            st.markdown("**BUY**")
             if not buys:
                 st.write("-")
             else:
                 for t, q in buys:
-                    st.write(f"{t} {q}주 매수")
+                    st.write(f"{t} {q}주 BUY")
 
     def render_scores_bar():
-        st.subheader("VAA 모멘텀 스코어")
+        st.subheader("모멘텀스코어")
         df = vaa_scores_df(vaa)
         chart = (
             alt.Chart(df)
@@ -511,7 +511,7 @@ def render_execution_editor(result: dict, editor_prefix: str):
     result(추천안)에서 VAA/LAA/ODM holdings를 기본값으로 깔고,
     사용자가 전략별로 INPUT_TICKERS(10개) 수량을 조정해서 '실행본 holdings'를 만든다.
     """
-    st.subheader("실행본(저장할 보유) 편집")
+    st.subheader("실제 보유자산")
     st.caption("여기서 네가 실제로 매매한 수량대로 조정하고 저장하면, 다음 달 Monthly에서 수정 없이 그대로 쓸 수 있어. (현금은 저장 안 함)")
 
     executed = {"VAA": {"holdings": {}}, "LAA": {"holdings": {}}, "ODM": {"holdings": {}}}
@@ -663,7 +663,7 @@ if mode == "Annual":
         payload = export_holdings_only(executed, timestamp=result["timestamp"])
 
         st.download_button(
-            label="✅ 실행본(ETF만) 다운로드",
+            label="✅ 파일 다운로드",
             data=json.dumps(payload, indent=2),
             file_name=f"rebalance_exec_{result['timestamp'].replace(':','-').replace(' ','_')}.json",
             mime="application/json",
@@ -673,7 +673,7 @@ if mode == "Annual":
 else:
     st.header("Monthly Rebalancing")
 
-    uploaded = st.file_uploader("File Upload (이전 실행본 JSON)", type=["json"])
+    uploaded = st.file_uploader("File Upload", type=["json"])
     if not uploaded:
         st.stop()
 
@@ -701,11 +701,11 @@ else:
 
     prev = json.loads(json.dumps(prev_raw))  # deep copy
 
-    st.subheader("이번 달 현금($)")
-    cash_usd = money_input("현금($)", key="m_cash_usd", default=0, allow_decimal=True)
+    st.subheader("현금($)")
+    cash_usd = money_input(key="m_cash_usd", default=0, allow_decimal=True)
 
     # 이전 실행본 요약(선택)
-    with st.expander("이전 실행본(업로드된 holdings) 확인", expanded=False):
+    with st.expander("Previous", expanded=False):
         merged_prev = merge_holdings(prev["VAA"]["holdings"], prev["LAA"]["holdings"], prev["ODM"]["holdings"])
         items = [(t, int(q)) for t, q in merged_prev.items() if int(q) != 0]
         items.sort(key=lambda x: x[0])
@@ -720,7 +720,7 @@ else:
     run_btn = st.button("REBALANCE", type="primary")
     if run_btn:
         try:
-            with st.spinner("계산 중..."):
+            with st.spinner("Calculating..."):
                 result = run_month(prev, cash_usd)
             st.session_state["monthly_result"] = result
             _clear_keys_with_prefix("exec_monthly_")  # 새 추천안이면 실행본 편집 초기화
