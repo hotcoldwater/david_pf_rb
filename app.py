@@ -1,4 +1,5 @@
 import json
+import hashlib
 from datetime import datetime, timedelta
 
 import altair as alt
@@ -54,6 +55,10 @@ with c_a:
 with c_r:
     if st.button("Refresh", use_container_width=True):
         st.cache_data.clear()
+        # 실행 결과/편집 상태도 같이 초기화
+        for k in list(st.session_state.keys()):
+            if k.startswith(("annual_result", "monthly_result", "exec_annual_", "exec_monthly_", "monthly_file_sig")):
+                del st.session_state[k]
         st.rerun()
 
 st.divider()
@@ -362,6 +367,10 @@ def vaa_scores_df(vaa: dict) -> pd.DataFrame:
 # 결과 표시(UI 정리 버전)
 # ======================
 def show_result(result: dict, current_holdings: dict, layout: str = "side"):
+    """
+    ✅ 여기서는 '추천안(result)' 기반으로만 보여줌.
+    저장은 아래 '실행본 편집'에서 받은 holdings로 따로 저장.
+    """
     rate = float(result["meta"]["usdkrw_rate"])
     price_map = result["meta"]["prices_adj_close"]
 
@@ -395,7 +404,7 @@ def show_result(result: dict, current_holdings: dict, layout: str = "side"):
     all_target = merge_holdings(vaa_h, laa_h, odm_h)
 
     def render_target_clean():
-        st.subheader("목표 보유")
+        st.subheader("목표 보유(추천안)")
         items = [(t, int(q)) for t, q in all_target.items() if int(q) != 0 and t != "BIL"]
         items.sort(key=lambda x: x[0])
 
@@ -409,7 +418,7 @@ def show_result(result: dict, current_holdings: dict, layout: str = "side"):
                 st.metric(t, f"{q}주")
 
     def render_trades_clean():
-        st.subheader("매수/매도")
+        st.subheader("매수/매도(추천안 기준)")
         rows = []
         for t in sorted(set(current_holdings.keys()) | set(all_target.keys())):
             if t == "BIL":
@@ -474,6 +483,55 @@ def show_result(result: dict, current_holdings: dict, layout: str = "side"):
 
 
 # ======================
+# 실행본 편집 + 저장(JSON: ETF만)
+# ======================
+def _clear_keys_with_prefix(prefix: str):
+    for k in list(st.session_state.keys()):
+        if k.startswith(prefix):
+            del st.session_state[k]
+
+
+def export_holdings_only(executed: dict, timestamp: str) -> dict:
+    """
+    ✅ 저장 JSON에는 현금 제외, ETF holdings만 저장
+    executed = {"VAA":{...}, "LAA":{...}, "ODM":{...}} (각각 holdings dict)
+    """
+    payload = {
+        "timestamp": timestamp,
+        "schema_version": "holdings_only_v1",
+        "VAA": {"holdings": {t: int(q) for t, q in executed["VAA"]["holdings"].items() if int(q) != 0}},
+        "LAA": {"holdings": {t: int(q) for t, q in executed["LAA"]["holdings"].items() if int(q) != 0}},
+        "ODM": {"holdings": {t: int(q) for t, q in executed["ODM"]["holdings"].items() if int(q) != 0}},
+    }
+    return payload
+
+
+def render_execution_editor(result: dict, editor_prefix: str):
+    """
+    result(추천안)에서 VAA/LAA/ODM holdings를 기본값으로 깔고,
+    사용자가 전략별로 INPUT_TICKERS(10개) 수량을 조정해서 '실행본 holdings'를 만든다.
+    """
+    st.subheader("실행본(저장할 보유) 편집")
+    st.caption("여기서 네가 실제로 매매한 수량대로 조정하고 저장하면, 다음 달 Monthly에서 수정 없이 그대로 쓸 수 있어. (현금은 저장 안 함)")
+
+    executed = {"VAA": {"holdings": {}}, "LAA": {"holdings": {}}, "ODM": {"holdings": {}}}
+
+    for strat in ["VAA", "LAA", "ODM"]:
+        rec = result[strat]["holdings"]
+        with st.expander(f"{strat} 실행본 수량 조정", expanded=(strat == "VAA")):
+            cols = st.columns(5)
+            for i, t in enumerate(INPUT_TICKERS):
+                default_q = int(rec.get(t, 0))
+                key = f"{editor_prefix}{strat}_{t}"
+                with cols[i % 5]:
+                    q = st.number_input(t, min_value=0, value=default_q, step=1, key=key)
+                if int(q) != 0:
+                    executed[strat]["holdings"][t] = int(q)
+
+    return executed
+
+
+# ======================
 # 날짜 기준
 # ======================
 today = datetime.today()
@@ -517,7 +575,7 @@ def run_year(amounts: dict, cash_usd: float):
             "usdkrw_rate": float(usdkrw_rate),
             "prices_adj_close": {t: float(prices[t]) for t in TICKER_LIST},
             "input_cash_usd": float(cash_usd),
-            "cash_rule": "Cash is always user input (USD). Monthly rebalance splits input cash 1/3 per strategy and ignores prev cash_usd.",
+            "cash_rule": "Annual: total_usd includes input cash; budget split 1/3 per strategy. (Cash is NOT saved to JSON.)",
         },
         "VAA": {"holdings": vaa_hold, "cash_usd": float(vaa_cash_usd), "picked": best_vaa, "scores": scores},
         "LAA": {"holdings": laa_hold, "cash_usd": float(laa_cash_usd), "safe": laa_safe},
@@ -553,7 +611,7 @@ def run_month(prev: dict, cash_usd: float):
             "usdkrw_rate": float(usdkrw_rate),
             "prices_adj_close": {t: float(prices[t]) for t in TICKER_LIST},
             "input_cash_usd": float(cash_usd),
-            "cash_rule": "Monthly: budget=strategy holdings value only; input cash (USD) split equally 1/3; prev cash_usd ignored.",
+            "cash_rule": "Monthly: prev holdings value + cash_each(=input cash/3). (Cash is NOT saved to JSON.)",
         },
         "VAA": {"holdings": vaa_hold, "cash_usd": float(vaa_cash_usd), "picked": best_vaa, "scores": scores},
         "LAA": {"holdings": laa_hold, "cash_usd": float(laa_cash_usd), "safe": laa_safe},
@@ -564,107 +622,126 @@ def run_month(prev: dict, cash_usd: float):
 # ======================
 # 화면: Annual / Monthly
 # ======================
-if mode.startswith("Annual"):
+if mode == "Annual":
     st.header("Annual Rebalancing")
 
-    st.subheader("Assets")
+    st.subheader("Assets (현재 보유 수량)")
     amounts = {}
-    cash_usd = 0.0
 
-    # ✅ 10개 티커 + CASH = 11개 → 6칸+5칸으로 2줄 고정 (입력칸 작아짐)
+    # ✅ 10개 티커 + 현금 = 11개 → 6칸 그리드
     fields = INPUT_TICKERS + ["현금($)"]
-    cols = st.columns(6)  # ← 기존 4에서 6으로 변경
+    cols = st.columns(6)
 
+    cash_usd = 0.0
     for i, f in enumerate(fields):
         with cols[i % 6]:
-            if f == "CASH($)":
-                cash_usd = money_input("CASH($)", key="y_cash_usd", default=0, allow_decimal=True)
+            if f == "현금($)":
+                cash_usd = money_input("현금($)", key="y_cash_usd", default=0, allow_decimal=True)
             else:
                 amounts[f] = st.number_input(f, min_value=0, value=0, step=1, key=f"y_amt_{f}")
 
-    if st.button("Rebalance", type="primary"):
+    run_btn = st.button("Rebalance", type="primary")
+    if run_btn:
         try:
             with st.spinner("계산 중..."):
                 result = run_year(amounts, cash_usd)
-
+            st.session_state["annual_result"] = result
+            _clear_keys_with_prefix("exec_annual_")  # 실행본 편집 키 초기화
             st.success("완료")
-
-            current_holdings = {t: int(amounts.get(t, 0)) for t in INPUT_TICKERS}
-            show_result(result, current_holdings, layout="side")
-
-            st.download_button(
-                label="✅ 결과 다운로드",
-                data=json.dumps(result, indent=2),
-                file_name=f"rebalance_{result['timestamp'].replace(':','-').replace(' ','_')}.json",
-                mime="application/json",
-            )
         except Exception as e:
             st.error(str(e))
+
+    # 결과가 있으면 표시 + 실행본 편집 + 저장
+    if "annual_result" in st.session_state:
+        result = st.session_state["annual_result"]
+        current_holdings = {t: int(amounts.get(t, 0)) for t in INPUT_TICKERS}
+
+        show_result(result, current_holdings, layout="side")
+        st.divider()
+
+        executed = render_execution_editor(result, editor_prefix="exec_annual_")
+        payload = export_holdings_only(executed, timestamp=result["timestamp"])
+
+        st.download_button(
+            label="✅ 실행본(ETF만) 다운로드",
+            data=json.dumps(payload, indent=2),
+            file_name=f"rebalance_exec_{result['timestamp'].replace(':','-').replace(' ','_')}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
 
 else:
     st.header("Monthly Rebalancing")
 
-    uploaded = st.file_uploader("File Upload", type=["json"])
+    uploaded = st.file_uploader("File Upload (이전 실행본 JSON)", type=["json"])
     if not uploaded:
         st.stop()
 
+    raw_bytes = uploaded.getvalue()
+    file_sig = hashlib.md5(raw_bytes).hexdigest()
+
+    # 파일 바뀌면 월간 결과/편집키 초기화
+    if st.session_state.get("monthly_file_sig") != file_sig:
+        st.session_state["monthly_file_sig"] = file_sig
+        if "monthly_result" in st.session_state:
+            del st.session_state["monthly_result"]
+        _clear_keys_with_prefix("exec_monthly_")
+
     try:
-        prev_raw = json.loads(uploaded.getvalue().decode("utf-8"))
+        prev_raw = json.loads(raw_bytes.decode("utf-8"))
     except Exception:
         st.error("업로드 파일이 JSON 파싱에 실패했어. (파일 깨짐/형식 오류)")
         st.stop()
 
-    needed = ["VAA", "LAA", "ODM", "meta"]
-    if any(k not in prev_raw for k in needed):
-        st.error("이 JSON은 예상 형식이 아니야. (VAA/LAA/ODM/meta 키가 필요)")
-        st.stop()
+    # 최소 요구: VAA/LAA/ODM + holdings
+    for k in ["VAA", "LAA", "ODM"]:
+        if k not in prev_raw or "holdings" not in prev_raw[k]:
+            st.error("이 JSON은 예상 형식이 아니야. (VAA/LAA/ODM 안에 holdings가 필요)")
+            st.stop()
 
     prev = json.loads(json.dumps(prev_raw))  # deep copy
 
-    st.subheader("Assets")
+    st.subheader("이번 달 현금($)")
+    cash_usd = money_input("현금($)", key="m_cash_usd", default=0, allow_decimal=True)
 
-    edit_prev = st.checkbox("Changes", value=False)
+    # 이전 실행본 요약(선택)
+    with st.expander("이전 실행본(업로드된 holdings) 확인", expanded=False):
+        merged_prev = merge_holdings(prev["VAA"]["holdings"], prev["LAA"]["holdings"], prev["ODM"]["holdings"])
+        items = [(t, int(q)) for t, q in merged_prev.items() if int(q) != 0]
+        items.sort(key=lambda x: x[0])
+        if not items:
+            st.write("-")
+        else:
+            cols = st.columns(5)
+            for i, (t, q) in enumerate(items):
+                with cols[i % 5]:
+                    st.metric(t, f"{q}주")
 
-    if edit_prev:
-        for strat in ["VAA", "LAA", "ODM"]:
-            with st.expander(f"{strat}", expanded=False):
-                existing_hold = prev[strat].get("holdings", {})
-
-                preserved = {t: int(q) for t, q in existing_hold.items() if t not in INPUT_TICKERS and t != "BIL"}
-
-                new_hold = {}
-                cols = st.columns(4)
-                for i, t in enumerate(INPUT_TICKERS):
-                    default_q = int(existing_hold.get(t, 0))
-                    with cols[i % 4]:
-                        q = st.number_input(f"{t}", min_value=0, value=default_q, step=1, key=f"m_edit_{strat}_{t}")
-                    if int(q) != 0:
-                        new_hold[t] = int(q)
-
-                merged = {}
-                merged.update(preserved)
-                merged.update(new_hold)
-                prev[strat]["holdings"] = merged
-
-    cols_cash = st.columns(4)
-    with cols_cash[0]:
-        cash_usd = money_input("현금($)", key="m_cash_usd", default=0, allow_decimal=True)
-
-    if st.button("REBALANCE", type="primary"):
+    run_btn = st.button("REBALANCE", type="primary")
+    if run_btn:
         try:
             with st.spinner("계산 중..."):
                 result = run_month(prev, cash_usd)
-
+            st.session_state["monthly_result"] = result
+            _clear_keys_with_prefix("exec_monthly_")  # 새 추천안이면 실행본 편집 초기화
             st.success("Completed")
-
-            current_holdings = merge_holdings(prev["VAA"]["holdings"], prev["LAA"]["holdings"], prev["ODM"]["holdings"])
-            show_result(result, current_holdings, layout="side")
-
-            st.download_button(
-                label="✅ 결과 다운로드",
-                data=json.dumps(result, indent=2),
-                file_name=f"rebalance_{result['timestamp'].replace(':','-').replace(' ','_')}.json",
-                mime="application/json",
-            )
         except Exception as e:
             st.error(str(e))
+
+    if "monthly_result" in st.session_state:
+        result = st.session_state["monthly_result"]
+        current_holdings = merge_holdings(prev["VAA"]["holdings"], prev["LAA"]["holdings"], prev["ODM"]["holdings"])
+
+        show_result(result, current_holdings, layout="side")
+        st.divider()
+
+        executed = render_execution_editor(result, editor_prefix="exec_monthly_")
+        payload = export_holdings_only(executed, timestamp=result["timestamp"])
+
+        st.download_button(
+            label="✅ 실행본(ETF만) 다운로드",
+            data=json.dumps(payload, indent=2),
+            file_name=f"rebalance_exec_{result['timestamp'].replace(':','-').replace(' ','_')}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
