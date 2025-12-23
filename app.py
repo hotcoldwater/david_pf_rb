@@ -567,12 +567,12 @@ def run_month(prev: dict, cash_usd: float):
 if mode.startswith("Annual"):
     st.header("Annual Rebalancing")
 
-    st.subheader("보유자산")
+    st.subheader("Assets")
     amounts = {}
     cash_usd = 0.0
 
     # ✅ 10개 티커 + CASH = 11개 → 6칸+5칸으로 2줄 고정 (입력칸 작아짐)
-    fields = INPUT_TICKERS + ["CASH($)"]
+    fields = INPUT_TICKERS + ["현금($)"]
     cols = st.columns(6)  # ← 기존 4에서 6으로 변경
 
     for i, f in enumerate(fields):
