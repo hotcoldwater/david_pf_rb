@@ -472,14 +472,13 @@ def compute_vaa_scores(prices: dict) -> dict:
     return {t: float(momentum_score(t, prices, d_1m, d_3m, d_6m, d_12m)) for t in VAA_UNIVERSE}
 
 
-def run_year(amounts: dict, krw_cash: float, usd_cash: float, krw_add: float, usd_add: float):
-    # ✅ 입력 티커(BIL 제외)만 보유로 인정
-    total_usd = (
-        sum(float(amounts.get(t, 0.0)) * float(prices[t]) for t in INPUT_TICKERS)
-        + (float(krw_cash) / float(usdkrw_rate)) + float(usd_cash)
-        + (float(krw_add) / float(usdkrw_rate)) + float(usd_add)
-    )
-
+def run_year(amounts: dict, cash_usd: float):
+    """
+    ✅ 입력 현금은 USD 하나
+    - total_usd = 보유 ETF 평가금액(전체) + 입력 현금(USD)
+    - budget_each = total_usd / 3
+    """
+    total_usd = sum(float(amounts.get(t, 0.0)) * float(prices[t]) for t in INPUT_TICKERS) + float(cash_usd)
     budget = float(total_usd) / 3.0
 
     scores = compute_vaa_scores(prices)
@@ -498,6 +497,8 @@ def run_year(amounts: dict, krw_cash: float, usd_cash: float, krw_add: float, us
         "meta": {
             "usdkrw_rate": float(usdkrw_rate),
             "prices_adj_close": {t: float(prices[t]) for t in TICKER_LIST},
+            "input_cash_usd": float(cash_usd),
+            "cash_rule": "Cash is always user input (USD). Monthly rebalance ignores prev cash_usd and splits input cash 1/3 per strategy.",
         },
         "VAA": {"holdings": vaa_hold, "cash_usd": float(vaa_cash_usd), "picked": best_vaa, "scores": scores},
         "LAA": {"holdings": laa_hold, "cash_usd": float(laa_cash_usd), "safe": laa_safe},
@@ -506,21 +507,22 @@ def run_year(amounts: dict, krw_cash: float, usd_cash: float, krw_add: float, us
     return result
 
 
-def run_month(prev: dict, krw_add: float, usd_add: float):
-    add_total_usd = (float(krw_add) / float(usdkrw_rate)) + float(usd_add)
-    add_each = float(add_total_usd) / 3.0
+def run_month(prev: dict, cash_usd: float):
+    """
+    ✅ 월간 리밸런싱 규칙(네가 말한 최종안)
+    - 전략별 총액 = '그 전략이 보유한 ETF 평가금액'만
+    - 사용자가 입력한 현금(USD)은 항상 (1/3)씩 전략에 분배
+    - prev[strat]['cash_usd'] 는 계산에 사용하지 않음(무시)
+    """
+    cash_each = float(cash_usd) / 3.0
 
     vaa_prev_hold = prev["VAA"]["holdings"]
     laa_prev_hold = prev["LAA"]["holdings"]
     odm_prev_hold = prev["ODM"]["holdings"]
 
-    vaa_prev_cash = float(prev["VAA"].get("cash_usd", 0.0))
-    laa_prev_cash = float(prev["LAA"].get("cash_usd", 0.0))
-    odm_prev_cash = float(prev["ODM"].get("cash_usd", 0.0))
-
-    vaa_budget = strategy_value_holdings(vaa_prev_hold, prices) + vaa_prev_cash + add_each
-    laa_budget = strategy_value_holdings(laa_prev_hold, prices) + laa_prev_cash + add_each
-    odm_budget = strategy_value_holdings(odm_prev_hold, prices) + odm_prev_cash + add_each
+    vaa_budget = strategy_value_holdings(vaa_prev_hold, prices) + cash_each
+    laa_budget = strategy_value_holdings(laa_prev_hold, prices) + cash_each
+    odm_budget = strategy_value_holdings(odm_prev_hold, prices) + cash_each
 
     scores = compute_vaa_scores(prices)
     best_vaa = max(scores, key=scores.get)
@@ -538,6 +540,8 @@ def run_month(prev: dict, krw_add: float, usd_add: float):
         "meta": {
             "usdkrw_rate": float(usdkrw_rate),
             "prices_adj_close": {t: float(prices[t]) for t in TICKER_LIST},
+            "input_cash_usd": float(cash_usd),
+            "cash_rule": "Monthly: budget=strategy holdings value only; input cash (USD) is always split equally 1/3; prev cash_usd ignored.",
         },
         "VAA": {"holdings": vaa_hold, "cash_usd": float(vaa_cash_usd), "picked": best_vaa, "scores": scores},
         "LAA": {"holdings": laa_hold, "cash_usd": float(laa_cash_usd), "safe": laa_safe},
@@ -552,28 +556,20 @@ def run_month(prev: dict, krw_add: float, usd_add: float):
 if mode.startswith("Annual Rebalancing"):
     st.header("Annual Rebalancing")
 
-    st.subheader("보유자산")
+    st.subheader("보유자산(주)")
     amounts = {}
     cols = st.columns(4)
     for i, t in enumerate(INPUT_TICKERS):  # ✅ BIL 제거
         with cols[i % 4]:
             amounts[t] = st.number_input(t, min_value=0, value=0, step=1, key=f"y_amt_{t}")
 
-    st.subheader("추가투자금액")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        krw_cash = money_input("현금(₩)", key="y_krw_cash", default=0, allow_decimal=False)
-    with c2:
-        usd_cash = money_input("현금($)", key="y_usd_cash", default=0, allow_decimal=True)
-    with c3:
-        krw_add = money_input("추가투자(₩)", key="y_krw_add", default=0, allow_decimal=False)
-    with c4:
-        usd_add = money_input("추가투자($)", key="y_usd_add", default=0, allow_decimal=True)
+    st.subheader("이번에 사용할 현금(USD)")
+    cash_usd = money_input("현금($)", key="y_cash_usd", default=0, allow_decimal=True)
 
     if st.button("리밸런싱 계산", type="primary"):
         try:
             with st.spinner("계산 중..."):
-                result = run_year(amounts, krw_cash, usd_cash, krw_add, usd_add)
+                result = run_year(amounts, cash_usd)
 
             st.success("완료")
 
@@ -607,53 +603,46 @@ else:
         st.error("이 JSON은 예상 형식이 아니야. (VAA/LAA/ODM/meta 키가 필요)")
         st.stop()
 
-    edit_prev = st.checkbox("정보수정", value=False)
+    edit_prev = st.checkbox("정보수정(보유 ETF만)", value=False)
     prev = json.loads(json.dumps(prev_raw))  # deep copy
 
     if edit_prev:
-        st.subheader("업로드 내용 수정")
+        st.subheader("업로드 내용 수정(보유 ETF만)")
 
         for strat in ["VAA", "LAA", "ODM"]:
             with st.expander(f"{strat}", expanded=False):
-                default_cash = float(prev[strat].get("cash_usd", 0.0))
-                cash_val = money_input(
-                    f"{strat} 현금(USD)",
-                    key=f"m_edit_{strat}_cash",
-                    default=default_cash,
-                    allow_decimal=True,
-                )
+                # ✅ cash_usd는 입력으로만 받으므로 여기서 수정/사용 안 함
+                existing_hold = prev[strat].get("holdings", {})
+
+                # INPUT_TICKERS 외 티커는 기본 유지(단, BIL은 제거)
+                preserved = {t: int(q) for t, q in existing_hold.items() if t not in INPUT_TICKERS and t != "BIL"}
 
                 new_hold = {}
                 cols = st.columns(4)
-                # ✅ BIL 입력칸 제거 + 불필요 티커 입력 줄이기
                 for i, t in enumerate(INPUT_TICKERS):
-                    default_q = int(prev[strat]["holdings"].get(t, 0))
+                    default_q = int(existing_hold.get(t, 0))
                     with cols[i % 4]:
                         q = st.number_input(f"{t}", min_value=0, value=default_q, step=1, key=f"m_edit_{strat}_{t}")
                     if int(q) != 0:
                         new_hold[t] = int(q)
 
-                # 기존 JSON에 INPUT_TICKERS 외 보유가 있었다면 유지(원하면 여기서 제거 가능)
-                # (전략이 실제로 쓰는 티커들은 INPUT_TICKERS에 대부분 포함됨)
-                prev[strat]["cash_usd"] = float(cash_val)
-                prev[strat]["holdings"] = new_hold
+                merged = {}
+                merged.update(preserved)
+                merged.update(new_hold)
+                prev[strat]["holdings"] = merged
 
-    st.subheader("추가투자금액")
-    c1, c2 = st.columns(2)
-    with c1:
-        krw_add = money_input("추가투자금액(₩)", key="m_krw_add", default=0, allow_decimal=False)
-    with c2:
-        usd_add = money_input("추가투자금액($)", key="m_usd_add", default=0, allow_decimal=True)
+    st.subheader("이번에 사용할 현금(USD)")
+    st.caption("✅ 월간: 입력 현금은 항상 1/3씩(VAA/LAA/ODM) 자동 분배됨. (이전 cash_usd는 계산에 사용 안 함)")
+    cash_usd = money_input("현금($)", key="m_cash_usd", default=0, allow_decimal=True)
 
     if st.button("REBALANCE", type="primary"):
         try:
             with st.spinner("계산 중..."):
-                result = run_month(prev, krw_add, usd_add)
+                result = run_month(prev, cash_usd)
 
             st.success("Completed")
 
             current_holdings = merge_holdings(prev["VAA"]["holdings"], prev["LAA"]["holdings"], prev["ODM"]["holdings"])
-            # ✅ BIL 등 불필요 티커는 show_result에서 자동 제외됨
             show_result(result, current_holdings, layout="stack")
 
             st.download_button(
