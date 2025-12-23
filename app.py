@@ -446,9 +446,9 @@ def show_result(result: dict, current_holdings: dict, layout: str = "side"):
 # ======================
 with st.sidebar:
     st.subheader("_____________________")
-    mode = st.radio("Options", ["Monthly Rebalancing", "Annual Rebalancing"], index=0)
+    mode = st.radio("REBALANCING", ["Monthly", "Annual"], index=0)
 
-    if st.button("새로고침"):
+    if st.button("Refresh"):
         st.cache_data.clear()
         st.rerun()
 
@@ -559,7 +559,7 @@ if mode.startswith("Annual Rebalancing"):
     st.header("Annual Rebalancing")
 
     # ✅ 현금을 "보유자산(주)" 섹션 안에 한 항목으로 포함
-    st.subheader("보유자산(주)")
+    st.subheader("보유자산")
     amounts = {}
     cash_usd = 0.0
 
@@ -585,7 +585,7 @@ if mode.startswith("Annual Rebalancing"):
             show_result(result, current_holdings, layout="side")
 
             st.download_button(
-                label="✅ 결과 JSON 다운로드(저장)",
+                label="✅ 결과 다운로드",
                 data=json.dumps(result, indent=2),
                 file_name=f"rebalance_{result['timestamp'].replace(':','-').replace(' ','_')}.json",
                 mime="application/json",
@@ -614,10 +614,9 @@ else:
     prev = json.loads(json.dumps(prev_raw))  # deep copy
 
     # ✅ '보유자산(주)' 섹션 안에 CASH($)도 같이 포함(별도 섹션으로 빼지 않음)
-    st.subheader("보유자산(주)")
-    st.caption("월간: CASH($) 입력분은 항상 1/3씩(VAA/LAA/ODM) 자동 분배됨. (업로드된 cash_usd는 계산에 사용 안 함)")
+    st.subheader("보유자산")
 
-    edit_prev = st.checkbox("정보수정(보유 ETF만)", value=False)
+    edit_prev = st.checkbox("정보수정", value=False)
 
     if edit_prev:
         for strat in ["VAA", "LAA", "ODM"]:
@@ -644,7 +643,7 @@ else:
     # ✅ CASH($)도 보유자산 섹션 안의 "한 항목"으로 배치 (별도 subheader 없음)
     cols_cash = st.columns(4)
     with cols_cash[0]:
-        cash_usd = money_input("CASH($)", key="m_cash_usd", default=0, allow_decimal=True)
+        cash_usd = money_input("현금($)", key="m_cash_usd", default=0, allow_decimal=True)
 
     if st.button("REBALANCE", type="primary"):
         try:
