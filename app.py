@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timedelta
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -11,12 +12,14 @@ import yfinance as yf
 # ======================
 TICKER_LIST = ["SPY", "EFA", "EEM", "AGG", "LQD", "IEF", "SHY", "IWD", "GLD", "QQQ", "BIL"]
 
+# ✅ 사용자가 직접 보유 입력하는 티커(=BIL 입력칸 제거)
+INPUT_TICKERS = [t for t in TICKER_LIST if t != "BIL"]
+
 # ✅ VAA 모멘텀 표기(7개) + 선택도 7개 중에서
 VAA_UNIVERSE = ["SPY", "EFA", "EEM", "AGG", "LQD", "IEF", "SHY"]
 
 st.set_page_config(page_title="Rebalance (Private)", layout="wide")
 st.title("리밸런싱 웹앱 (개인용)")
-st.caption("저장 방식: 결과 JSON 다운로드 → 다음달에 JSON 업로드로 이어가기")
 
 
 # ======================
@@ -153,13 +156,10 @@ def fx_usdkrw() -> float:
 def _unrate_info(today: datetime):
     """
     ✅ pandas_datareader 없이 FRED(UNRATE) 가져오기 (Python 3.12 호환)
-    FRED 제공 CSV:
-      https://fred.stlouisfed.org/graph/fredgraph.csv?id=UNRATE
     """
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=UNRATE"
     df = pd.read_csv(url)
 
-    # 컬럼: DATE, UNRATE
     df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
     df["UNRATE"] = pd.to_numeric(df["UNRATE"], errors="coerce")
     df = df.dropna(subset=["DATE", "UNRATE"])
@@ -207,6 +207,8 @@ def momentum_score(t: str, prices: dict, d_1m, d_3m, d_6m, d_12m) -> float:
 def strategy_value_holdings(holdings: dict, price_map: dict) -> float:
     total = 0.0
     for t, q in holdings.items():
+        if t not in price_map:
+            continue
         total += float(price_map[t]) * int(q)
     return float(total)
 
@@ -306,28 +308,6 @@ def merge_holdings(*holding_dicts):
     return merged
 
 
-def trade_plan_df(current: dict, target: dict, price_map: dict) -> pd.DataFrame:
-    tickers = sorted(set(current.keys()) | set(target.keys()))
-    rows = []
-    for t in tickers:
-        cur = int(current.get(t, 0))
-        tar = int(target.get(t, 0))
-        delta = tar - cur
-        action = "BUY" if delta > 0 else "SELL" if delta < 0 else "-"
-        est_usd = float(delta) * float(price_map.get(t, 0.0))
-        rows.append(
-            {
-                "Ticker": t,
-                "Current Qty": cur,
-                "Target Qty": tar,
-                "Delta": delta,
-                "Action": action,
-                "Est. Cash Impact (USD)": est_usd,
-            }
-        )
-    return pd.DataFrame(rows)
-
-
 def vaa_scores_df(vaa: dict) -> pd.DataFrame:
     scores = vaa.get("scores", {})
     rows = [{"Ticker": t, "Momentum Score": float(scores.get(t, -9999))} for t in VAA_UNIVERSE]
@@ -336,13 +316,13 @@ def vaa_scores_df(vaa: dict) -> pd.DataFrame:
 
 
 # ======================
-# 결과 표시
+# 결과 표시(UI 정리 버전)
 # ======================
 def show_result(result: dict, current_holdings: dict, layout: str = "stack"):
     """
     layout:
-      - "side": (연 리밸런싱) 좌/우로: 오른쪽에 VAA 모멘텀표
-      - "stack": (월 리밸런싱) 기존처럼 아래로
+      - "side": (연 리밸런싱) 좌/우로: 오른쪽에 모멘텀 막대그래프
+      - "stack": (월 리밸런싱) 위->아래
     """
     rate = float(result["meta"]["usdkrw_rate"])
     price_map = result["meta"]["prices_adj_close"]
@@ -360,13 +340,12 @@ def show_result(result: dict, current_holdings: dict, layout: str = "stack"):
     odm_cash = float(odm.get("cash_usd", 0.0))
 
     def holdings_value_usd(h):
-        return sum(float(price_map[t]) * int(q) for t, q in h.items())
+        return sum(float(price_map[t]) * int(q) for t, q in h.items() if t in price_map)
 
     total_holdings_usd = holdings_value_usd(vaa_h) + holdings_value_usd(laa_h) + holdings_value_usd(odm_h)
     total_cash_usd = vaa_cash + laa_cash + odm_cash
     total_usd = total_holdings_usd + total_cash_usd
 
-    # ✅ 상단 요약: 총자산/현금 = 원화, 보유자산 표시 제거
     total_krw = total_usd * rate
     cash_krw = total_cash_usd * rate
 
@@ -375,58 +354,86 @@ def show_result(result: dict, current_holdings: dict, layout: str = "stack"):
     b.metric("현금(원)", f"₩{cash_krw:,.0f}")
     c.metric("달러환율(원/달러)", f"₩{rate:,.2f}")
 
-    st.write(
-        f"**VAA picked:** {vaa.get('picked')}  |  "
-        f"**LAA safe:** {laa.get('safe')}  |  "
-        f"**ODM picked:** {odm.get('picked')}"
-    )
-
     all_target = merge_holdings(vaa_h, laa_h, odm_h)
 
-    def render_main_tables():
+    def render_target_clean():
+        st.subheader("목표 보유")
+        items = [(t, int(q)) for t, q in all_target.items() if int(q) != 0 and t != "BIL"]
+        items.sort(key=lambda x: x[0])
+
+        if not items:
+            st.write("-")
+            return
+
+        cols = st.columns(5)
+        for i, (t, q) in enumerate(items):
+            with cols[i % 5]:
+                st.metric(t, f"{q}주")
+
+    def render_trades_clean():
+        st.subheader("매수/매도 수량")
         rows = []
-        for t in sorted(all_target.keys()):
-            qty = int(all_target[t])
-            if qty == 0:
+        for t in sorted(set(current_holdings.keys()) | set(all_target.keys())):
+            if t == "BIL":
                 continue
-            px = float(price_map.get(t, 0.0))
-            val_usd = px * qty
-            val_krw = val_usd * rate
-            rows.append({"Ticker": t, "Qty": qty, "Price(USD)": px, "Value(USD)": val_usd, "Value(KRW)": val_krw})
+            cur = int(current_holdings.get(t, 0))
+            tar = int(all_target.get(t, 0))
+            delta = tar - cur
+            if delta != 0:
+                rows.append((t, delta))
 
-        st.subheader("목표 보유 ETF (TOTAL)")
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        if not rows:
+            st.write("-")
+            return
 
-        st.subheader("전략별 요약")
-        strat_rows = []
-        for name, h, csh in [("VAA", vaa_h, vaa_cash), ("LAA", laa_h, laa_cash), ("ODM", odm_h, odm_cash)]:
-            hv = holdings_value_usd(h)
-            tv = hv + csh
-            w = (tv / total_usd * 100) if total_usd > 0 else 0.0
-            strat_rows.append(
-                {"Strategy": name, "Total(USD)": tv, "Holdings(USD)": hv, "Cash(USD)": csh, "Weight(%)": w}
+        # 큰 변화 먼저
+        rows.sort(key=lambda x: (abs(x[1]), x[0]), reverse=True)
+
+        sells = [(t, -d) for t, d in rows if d < 0]
+        buys = [(t, d) for t, d in rows if d > 0]
+
+        left, right = st.columns(2)
+        with left:
+            st.markdown("**매도**")
+            if not sells:
+                st.write("-")
+            else:
+                for t, q in sells:
+                    st.write(f"{t} {q}주 매도")
+        with right:
+            st.markdown("**매수**")
+            if not buys:
+                st.write("-")
+            else:
+                for t, q in buys:
+                    st.write(f"{t} {q}주 매수")
+
+    def render_scores_bar():
+        st.subheader("VAA 모멘텀 스코어")
+        df = vaa_scores_df(vaa)
+        chart = (
+            alt.Chart(df)
+            .mark_bar()
+            .encode(
+                x=alt.X("Ticker:N", sort=alt.SortField(field="Momentum Score", order="descending")),
+                y=alt.Y("Momentum Score:Q"),
+                tooltip=["Ticker:N", alt.Tooltip("Momentum Score:Q", format=".4f")],
             )
-        st.dataframe(pd.DataFrame(strat_rows), use_container_width=True)
-
-        st.subheader("매수/매도 수량 (현재 보유 vs 목표)")
-        df_trades = trade_plan_df(current_holdings, all_target, price_map)
-        df_trades["AbsDelta"] = df_trades["Delta"].abs()
-        df_trades = df_trades.sort_values(["AbsDelta", "Ticker"], ascending=[False, True]).drop(columns=["AbsDelta"])
-        st.dataframe(df_trades, use_container_width=True)
-
-    def render_scores():
-        st.subheader("VAA 모멘텀 스코어 (7개)")
-        st.dataframe(vaa_scores_df(vaa), use_container_width=True)
+            .properties(height=280)
+        )
+        st.altair_chart(chart, use_container_width=True)
 
     if layout == "side":
         left, right = st.columns([2, 1], gap="large")
         with right:
-            render_scores()
+            render_scores_bar()
         with left:
-            render_main_tables()
+            render_target_clean()
+            render_trades_clean()
     else:
-        render_scores()
-        render_main_tables()
+        render_scores_bar()
+        render_target_clean()
+        render_trades_clean()
 
 
 # ======================
@@ -434,7 +441,8 @@ def show_result(result: dict, current_holdings: dict, layout: str = "stack"):
 # ======================
 with st.sidebar:
     st.subheader("모드")
-    mode = st.radio("리밸런싱 타입", ["Year (Y)", "Month (M)"], index=0)
+    # ✅ 월 리밸런싱이 먼저 뜨도록 (기본값 Month)
+    mode = st.radio("리밸런싱 타입", ["Month (M)", "Year (Y)"], index=0)
 
     if st.button("시장데이터 새로고침(캐시 삭제)"):
         st.cache_data.clear()
@@ -450,16 +458,11 @@ d_1m, d_3m, d_6m, d_12m = [today_naive - timedelta(days=d) for d in [30, 90, 180
 
 
 # ======================
-# 시장 데이터 로드
+# 시장 데이터 로드(표시 UI는 제거)
 # ======================
 with st.spinner("가격/환율 불러오는 중..."):
     prices = {t: last_adj_close(t) for t in TICKER_LIST}
     usdkrw_rate = fx_usdkrw()
-
-with st.expander("현재가(Adj Close) / 달러환율 보기"):
-    px_df = pd.DataFrame([{"Ticker": t, "Adj Close(USD)": float(prices[t])} for t in TICKER_LIST]).set_index("Ticker")
-    st.dataframe(px_df, use_container_width=True)
-    st.write(f"달러환율(원/달러): **₩{usdkrw_rate:,.2f}**")
 
 
 # ======================
@@ -470,8 +473,9 @@ def compute_vaa_scores(prices: dict) -> dict:
 
 
 def run_year(amounts: dict, krw_cash: float, usd_cash: float, krw_add: float, usd_add: float):
+    # ✅ 입력 티커(BIL 제외)만 보유로 인정
     total_usd = (
-        sum(float(amounts.get(t, 0.0)) * float(prices[t]) for t in TICKER_LIST)
+        sum(float(amounts.get(t, 0.0)) * float(prices[t]) for t in INPUT_TICKERS)
         + (float(krw_cash) / float(usdkrw_rate)) + float(usd_cash)
         + (float(krw_add) / float(usdkrw_rate)) + float(usd_add)
     )
@@ -543,19 +547,19 @@ def run_month(prev: dict, krw_add: float, usd_add: float):
 
 
 # ======================
-# 화면: Year / Month
+# 화면: Month / Year
 # ======================
 if mode.startswith("Year"):
-    st.header("Year (Y) — 연 리밸런싱")
+    st.header("Year (Y)")
 
     st.subheader("현재 보유 수량(주)")
     amounts = {}
     cols = st.columns(4)
-    for i, t in enumerate(TICKER_LIST):
+    for i, t in enumerate(INPUT_TICKERS):  # ✅ BIL 제거
         with cols[i % 4]:
             amounts[t] = st.number_input(t, min_value=0, value=0, step=1, key=f"y_amt_{t}")
 
-    st.subheader("현금/추가투자 (콤마 입력 가능)")
+    st.subheader("현금/추가투자")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         krw_cash = money_input("현금(₩)", key="y_krw_cash", default=0, allow_decimal=False)
@@ -573,8 +577,7 @@ if mode.startswith("Year"):
 
             st.success("완료")
 
-            current_holdings = {t: int(amounts.get(t, 0)) for t in TICKER_LIST}
-
+            current_holdings = {t: int(amounts.get(t, 0)) for t in INPUT_TICKERS}  # ✅ BIL 제거
             show_result(result, current_holdings, layout="side")
 
             st.download_button(
@@ -587,12 +590,10 @@ if mode.startswith("Year"):
             st.error(str(e))
 
 else:
-    st.header("Month (M) — 월 리밸런싱")
-    st.write("지난번에 다운로드한 JSON을 업로드하면, 그걸 기준으로 이번달 리밸런싱을 계산해.")
+    st.header("Month (M)")
 
     uploaded = st.file_uploader("이전 결과 JSON 업로드", type=["json"])
     if not uploaded:
-        st.info("먼저 Year(Y)로 결과를 계산하고 JSON을 다운로드한 다음, 여기서 업로드해.")
         st.stop()
 
     try:
@@ -606,17 +607,14 @@ else:
         st.error("이 JSON은 예상 형식이 아니야. (VAA/LAA/ODM/meta 키가 필요)")
         st.stop()
 
-    st.write("업로드된 이전 결과 timestamp:", prev_raw.get("timestamp", "(no timestamp)"))
-
-    edit_prev = st.checkbox("업로드된 내용을 수정할게 (보유/현금 직접 수정)", value=False)
-
+    edit_prev = st.checkbox("업로드된 내용을 수정", value=False)
     prev = json.loads(json.dumps(prev_raw))  # deep copy
 
     if edit_prev:
         st.subheader("업로드 내용 수정")
 
         for strat in ["VAA", "LAA", "ODM"]:
-            with st.expander(f"{strat} 보유/현금 수정", expanded=False):
+            with st.expander(f"{strat}", expanded=False):
                 default_cash = float(prev[strat].get("cash_usd", 0.0))
                 cash_val = money_input(
                     f"{strat} 현금(USD)",
@@ -627,19 +625,20 @@ else:
 
                 new_hold = {}
                 cols = st.columns(4)
-                for i, t in enumerate(TICKER_LIST):
+                # ✅ BIL 입력칸 제거 + 불필요 티커 입력 줄이기
+                for i, t in enumerate(INPUT_TICKERS):
                     default_q = int(prev[strat]["holdings"].get(t, 0))
                     with cols[i % 4]:
                         q = st.number_input(f"{t}", min_value=0, value=default_q, step=1, key=f"m_edit_{strat}_{t}")
                     if int(q) != 0:
                         new_hold[t] = int(q)
 
+                # 기존 JSON에 INPUT_TICKERS 외 보유가 있었다면 유지(원하면 여기서 제거 가능)
+                # (전략이 실제로 쓰는 티커들은 INPUT_TICKERS에 대부분 포함됨)
                 prev[strat]["cash_usd"] = float(cash_val)
                 prev[strat]["holdings"] = new_hold
 
-        st.caption("수정된 값이 이번달 계산의 '현재 보유/현금' 기준으로 사용됨.")
-
-    st.subheader("이번달 추가투자 (콤마 입력 가능)")
+    st.subheader("이번달 추가투자")
     c1, c2 = st.columns(2)
     with c1:
         krw_add = money_input("이번달 추가투자(₩)", key="m_krw_add", default=0, allow_decimal=False)
@@ -654,7 +653,7 @@ else:
             st.success("완료")
 
             current_holdings = merge_holdings(prev["VAA"]["holdings"], prev["LAA"]["holdings"], prev["ODM"]["holdings"])
-
+            # ✅ BIL 등 불필요 티커는 show_result에서 자동 제외됨
             show_result(result, current_holdings, layout="stack")
 
             st.download_button(
