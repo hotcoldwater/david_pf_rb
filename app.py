@@ -719,7 +719,7 @@ def run_month(prev: dict, cash_usd: float):
 
 
 # ======================
-# Backtest helpers (NEW)
+# Backtest helpers (UPDATED)
 # ======================
 BT_FX_TICKER = "USDKRW=X"
 
@@ -1038,9 +1038,11 @@ def bt_compute_twr_cagr(port_events: list, start_date: pd.Timestamp, end_date: p
     return (twr ** (1 / years) - 1) * 100
 
 
+# ✅ UPDATED: 벤치마크 정수 매수 고정 + 성과 통화(USD/KRW) 변환 지원
 def bt_simulate_benchmark_events(
     ticker: str,
-    ccy: str,  # "USD" or "KRW"
+    native_ccy: str,      # "USD" or "KRW"  (해당 벤치마크 자산의 거래 통화)
+    out_ccy: str,         # "USD" or "KRW"  (성과 계산/표시 기준 통화)
     rebalance_dates,
     eval_asof,
     bench_ff: pd.DataFrame,
@@ -1048,19 +1050,27 @@ def bt_simulate_benchmark_events(
     initial_total_usd: float,
     monthly_add_krw: float,
     monthly_add_usd: float,
-    fractional=True,
+    fractional: bool = False,  # ✅ 기본 False (정수 매수)
 ):
     shares = 0.0
-    cash = 0.0  # USD or KRW
+    cash_native = 0.0  # native_ccy 기준 현금
     events = []
 
-    def value_usd(asof: pd.Timestamp) -> float:
+    def value_out(asof: pd.Timestamp) -> float:
         fx_asof = float(fx_series.loc[:asof].iloc[-1])
         price = bt_px_on_or_before(bench_ff, asof, ticker)
-        if ccy == "USD":
-            return float(shares * price + cash)
-        v_krw = shares * price + cash
-        return float(v_krw / fx_asof)
+        v_native = float(shares * price + cash_native)
+
+        if out_ccy == native_ccy:
+            return v_native
+
+        # native -> out 변환
+        if native_ccy == "KRW" and out_ccy == "USD":
+            return float(v_native / fx_asof)
+        if native_ccy == "USD" and out_ccy == "KRW":
+            return float(v_native * fx_asof)
+
+        return v_native
 
     for m_idx, asof in enumerate(rebalance_dates):
         fx_asof = float(fx_series.loc[:asof].iloc[-1])
@@ -1068,31 +1078,35 @@ def bt_simulate_benchmark_events(
         if math.isnan(price) or price <= 0:
             raise RuntimeError(f"No benchmark price for {ticker} at {asof.date()}.")
 
-        pre = value_usd(asof)
+        pre = value_out(asof)
 
+        # ✅ 투자금(USD 환산) -> native 통화로 변환해 투입
         if m_idx == 0:
             add_usd = float(initial_total_usd)
         else:
             add_usd = float(monthly_add_usd + (monthly_add_krw / fx_asof))
 
-        add_ccy = add_usd if ccy == "USD" else add_usd * fx_asof
+        add_native = add_usd if native_ccy == "USD" else add_usd * fx_asof
 
         if fractional:
-            shares += add_ccy / price
+            # (이번 요구사항에선 안 씀)
+            shares += add_native / price
         else:
-            cash += add_ccy
-            q = int(cash // price)
+            # ✅ 정수 매수
+            cash_native += add_native
+            q = int(cash_native // price)
             shares += q
-            cash -= q * price
+            cash_native -= q * price
 
-        post = value_usd(asof)
+        post = value_out(asof)
         events.append((asof, float(pre), float(post)))
 
-    end_value = value_usd(eval_asof)
+    end_value = value_out(eval_asof)
     events.append((eval_asof, float(end_value), None))
     return events
 
 
+# ✅ UPDATED: USD/KRW 성과 둘 다 계산해서 반환 + 벤치마크 정수 매수 고정
 def bt_run_backtest(
     start_month_ym: str,
     end_date_in: str,
@@ -1101,8 +1115,7 @@ def bt_run_backtest(
     monthly_add_krw: float,
     monthly_add_usd: float,
     bench_label: str,
-    bench_fractional: bool,
-    rebalance_day: int,  # ✅ NEW
+    rebalance_day: int,
 ):
     start_month = bt_parse_start_month(start_month_ym)
     end_date = bt_parse_end_date(end_date_in)
@@ -1110,7 +1123,7 @@ def bt_run_backtest(
     data_start = start_month - timedelta(days=900)
     data_end = end_date + timedelta(days=10)
 
-    # ✅ NEW: All benchmarks 지원 (다운로드 티커에 모두 포함)
+    # ✅ All benchmarks 지원
     if bench_label == BT_ALL_BENCH_LABEL:
         bench_items = list(BT_BENCHMARKS.items())
         bench_tickers = [v[0] for _, v in bench_items]
@@ -1142,7 +1155,7 @@ def bt_run_backtest(
 
     # ✅ 벤치마크 가격도 같은 trading_index로 정렬/ffill
     bench_ff_map = {}
-    for label, (ticker, _ccy) in bench_items:
+    for label, (ticker, _native_ccy) in bench_items:
         if ticker not in prices_all.columns:
             raise RuntimeError(f"Missing benchmark price data: {ticker}")
         bench_raw = prices_all[[ticker]].copy()
@@ -1153,7 +1166,7 @@ def bt_run_backtest(
         end_str=data_end.strftime("%Y-%m-%d"),
     )
 
-    # ✅ 변경: 월 10일 고정 -> 사용자가 고른 day
+    # ✅ 리밸런싱일: 사용자가 고른 day
     nominal_dates = list(bt_month_day_schedule(start_month, end_date, rebalance_day=rebalance_day))
     rebalance_dates = [bt_next_trading_day(nd, trading_index) for nd in nominal_dates]
     if not rebalance_dates:
@@ -1161,7 +1174,10 @@ def bt_run_backtest(
 
     start_asof = rebalance_dates[0]
     fx0 = float(fx.loc[:start_asof].iloc[-1])
+
+    # ✅ 투자금 기준(USD/KRW) 둘 다 추적
     initial_total_usd = float(initial_usd + (initial_krw / fx0))
+    initial_total_krw = float(initial_krw + (initial_usd * fx0))
 
     state = {
         "VAA": {"holdings": {}, "cash": 0.0},
@@ -1181,18 +1197,16 @@ def bt_run_backtest(
         px_map = {t: bt_px_on_or_before(prices_ff, asof, t) for t in TICKER_LIST}
 
         if annual:
-            # ✅ 전체 포트 기준으로 1/3씩 재배분
             total_after = total_value(asof) + float(add_total_usd)
             budgets = {k: total_after / 3.0 for k in ["VAA", "LAA", "ODM"]}
         else:
-            # ✅ 전략 단위로 자기 포트 + add_each
             add_each = float(add_total_usd) / 3.0
             budgets = {}
             for k in ["VAA", "LAA", "ODM"]:
                 budgets[k] = value_of(state[k]["holdings"], asof) + float(state[k]["cash"]) + add_each
 
         scores = {t: bt_momentum_score(asof, prices_ff, t) for t in VAA_UNIVERSE}
-        best_vaa = pick_vaa_asset(scores)  # ✅ FIXED (same rule)
+        best_vaa = pick_vaa_asset(scores)
         vaa_hold, vaa_cash = bt_buy_all_in_if_affordable(best_vaa, budgets["VAA"], px_map[best_vaa])
 
         laa_safe = bt_safe_laa_asset(asof, prices_ff, unrate)
@@ -1207,24 +1221,33 @@ def bt_run_backtest(
         state["ODM"] = {"holdings": odm_hold, "cash": odm_cash, "picked": odm_asset}
 
     logs = []
-    port_events = []  # (date, pre_value_usd, post_value_usd)
+    port_events_usd = []  # (date, pre_value, post_value) in USD
+    port_events_krw = []  # (date, pre_value, post_value) in KRW
+
+    total_added_usd = 0.0
+    total_added_krw = 0.0
 
     for m_idx, asof in enumerate(rebalance_dates):
         fx_asof = float(fx.loc[:asof].iloc[-1])
 
-        pre_value = total_value(asof)
+        pre_value_usd = total_value(asof)
 
         if m_idx == 0:
             add_total_usd = float(initial_total_usd)
+            add_total_krw = float(initial_total_krw)
         else:
             add_total_usd = float(monthly_add_usd + (monthly_add_krw / fx_asof))
+            add_total_krw = float(monthly_add_krw + (monthly_add_usd * fx_asof))
+            total_added_usd += add_total_usd
+            total_added_krw += add_total_krw
 
         annual = bt_is_annual_rebalance(m_idx)
         rebalance_one_date(asof, annual=annual, add_total_usd=add_total_usd)
 
-        post_value = total_value(asof)
+        post_value_usd = total_value(asof)
 
-        port_events.append((asof, float(pre_value), float(post_value)))
+        port_events_usd.append((asof, float(pre_value_usd), float(post_value_usd)))
+        port_events_krw.append((asof, float(pre_value_usd * fx_asof), float(post_value_usd * fx_asof)))
 
         logs.append(
             {
@@ -1232,8 +1255,8 @@ def bt_run_backtest(
                 "month_idx": m_idx,
                 "annual": annual,
                 "fx": fx_asof,
-                "total_usd": post_value,
-                "total_krw": post_value * fx_asof,
+                "total_usd": post_value_usd,
+                "total_krw": post_value_usd * fx_asof,
                 "VAA_picked": state["VAA"].get("picked"),
                 "LAA_safe": state["LAA"].get("safe"),
                 "ODM_picked": state["ODM"].get("picked"),
@@ -1242,37 +1265,47 @@ def bt_run_backtest(
 
     eval_asof = bt_last_trading_day_on_or_before(end_date, trading_index)
     fx_end = float(fx.loc[:eval_asof].iloc[-1])
-    final_usd = total_value(eval_asof)
-    final_krw = final_usd * fx_end
+    final_usd = float(total_value(eval_asof))
+    final_krw = float(final_usd * fx_end)
 
-    port_events.append((eval_asof, float(final_usd), None))
+    port_events_usd.append((eval_asof, float(final_usd), None))
+    port_events_krw.append((eval_asof, float(final_krw), None))
 
-    total_added_usd = 0.0
-    for row in logs:
-        if int(row["month_idx"]) == 0:
-            continue
-        fx_row = float(row["fx"])
-        total_added_usd += float(monthly_add_usd + (monthly_add_krw / fx_row))
     total_invested_usd = float(initial_total_usd + total_added_usd)
+    total_invested_krw = float(initial_total_krw + total_added_krw)
 
-    ret_total = (final_usd / total_invested_usd - 1) * 100 if total_invested_usd > 0 else 0.0
-    port_cagr = bt_compute_twr_cagr(port_events=port_events, start_date=rebalance_dates[0], end_date=eval_asof)
+    ret_total_usd = (final_usd / total_invested_usd - 1) * 100 if total_invested_usd > 0 else 0.0
+    ret_total_krw = (final_krw / total_invested_krw - 1) * 100 if total_invested_krw > 0 else 0.0
+
+    port_cagr_usd = bt_compute_twr_cagr(port_events=port_events_usd, start_date=rebalance_dates[0], end_date=eval_asof)
+    port_cagr_krw = bt_compute_twr_cagr(port_events=port_events_krw, start_date=rebalance_dates[0], end_date=eval_asof)
 
     df_log = pd.DataFrame(logs)
 
-    # 포트 시계열
-    port_points = [(row["asof"], float(row["total_usd"])) for _, row in df_log.iterrows()]
-    port_points.append((eval_asof, float(final_usd)))
-    port_series = pd.Series([v for _, v in port_points], index=pd.to_datetime([d for d, _ in port_points]))
+    # 포트 시계열 (USD/KRW 둘 다)
+    port_points_usd = [(row["asof"], float(row["total_usd"])) for _, row in df_log.iterrows()]
+    port_points_usd.append((eval_asof, float(final_usd)))
+    port_series_usd = pd.Series([v for _, v in port_points_usd], index=pd.to_datetime([d for d, _ in port_points_usd]))
 
-    # ✅ 벤치마크 (단일 or 전체)
+    port_points_krw = [(row["asof"], float(row["total_krw"])) for _, row in df_log.iterrows()]
+    port_points_krw.append((eval_asof, float(final_krw)))
+    port_series_krw = pd.Series([v for _, v in port_points_krw], index=pd.to_datetime([d for d, _ in port_points_krw]))
+
+    def _events_to_series(events: list):
+        pts = [(d, post) for (d, _pre, post) in events[:-1]]  # rebalance dates: post
+        pts.append((events[-1][0], events[-1][1]))            # final eval: end_value
+        return pd.Series([v for _, v in pts], index=pd.to_datetime([d for d, _ in pts]))
+
+    # ✅ 벤치마크 (USD/KRW 둘 다) + ✅ 정수매수 고정(fractional=False)
     bench_results = {}
-    bench_series_map = {}
+    bench_series_map_usd = {}
+    bench_series_map_krw = {}
 
-    for label, (ticker, ccy) in bench_items:
-        bench_events = bt_simulate_benchmark_events(
+    for label, (ticker, native_ccy) in bench_items:
+        ev_usd = bt_simulate_benchmark_events(
             ticker=ticker,
-            ccy=ccy,
+            native_ccy=native_ccy,
+            out_ccy="USD",
             rebalance_dates=list(df_log["asof"]),
             eval_asof=eval_asof,
             bench_ff=bench_ff_map[label],
@@ -1280,53 +1313,85 @@ def bt_run_backtest(
             initial_total_usd=float(initial_total_usd),
             monthly_add_krw=float(monthly_add_krw),
             monthly_add_usd=float(monthly_add_usd),
-            fractional=bool(bench_fractional),
+            fractional=False,  # ✅ 정수만
         )
-        bench_final_usd = float(bench_events[-1][1])
-        bench_ret = (bench_final_usd / total_invested_usd - 1) * 100 if total_invested_usd > 0 else 0.0
-        bench_cagr = bt_compute_twr_cagr(port_events=bench_events, start_date=rebalance_dates[0], end_date=eval_asof)
+        ev_krw = bt_simulate_benchmark_events(
+            ticker=ticker,
+            native_ccy=native_ccy,
+            out_ccy="KRW",
+            rebalance_dates=list(df_log["asof"]),
+            eval_asof=eval_asof,
+            bench_ff=bench_ff_map[label],
+            fx_series=fx,
+            initial_total_usd=float(initial_total_usd),
+            monthly_add_krw=float(monthly_add_krw),
+            monthly_add_usd=float(monthly_add_usd),
+            fractional=False,  # ✅ 정수만
+        )
 
-        bench_points = [(d, post) for (d, _, post) in bench_events[:-1]]
-        bench_points.append((bench_events[-1][0], bench_events[-1][1]))
-        bench_series = pd.Series([v for _, v in bench_points], index=pd.to_datetime([d for d, _ in bench_points]))
+        bench_final_usd = float(ev_usd[-1][1])
+        bench_final_krw = float(ev_krw[-1][1])
+
+        bench_ret_usd = (bench_final_usd / total_invested_usd - 1) * 100 if total_invested_usd > 0 else 0.0
+        bench_ret_krw = (bench_final_krw / total_invested_krw - 1) * 100 if total_invested_krw > 0 else 0.0
+
+        bench_cagr_usd = bt_compute_twr_cagr(port_events=ev_usd, start_date=rebalance_dates[0], end_date=eval_asof)
+        bench_cagr_krw = bt_compute_twr_cagr(port_events=ev_krw, start_date=rebalance_dates[0], end_date=eval_asof)
+
+        bench_series_map_usd[label] = _events_to_series(ev_usd)
+        bench_series_map_krw[label] = _events_to_series(ev_krw)
 
         bench_results[label] = {
             "label": label,
             "ticker": ticker,
-            "ccy": ccy,
-            "fractional": bool(bench_fractional),
-            "final_usd": float(bench_final_usd),
-            "return_pct_vs_total_invested": float(bench_ret),
-            "cagr_twr_pct": float(bench_cagr),
+            "native_ccy": native_ccy,
+            "fractional": False,  # ✅ 고정
+            "final_usd": bench_final_usd,
+            "final_krw": bench_final_krw,
+            "return_pct_usd": float(bench_ret_usd),
+            "return_pct_krw": float(bench_ret_krw),
+            "cagr_twr_pct_usd": float(bench_cagr_usd),
+            "cagr_twr_pct_krw": float(bench_cagr_krw),
         }
-        bench_series_map[label] = bench_series
 
-    # 기존 호환(단일 모드일 때는 benchmark/bench_series를 그대로 제공)
+    # 단일/전체 벤치 payload
     if bench_label != BT_ALL_BENCH_LABEL:
-        one = bench_results[bench_label]
-        bench_series_single = bench_series_map[bench_label]
-        benchmark_payload = one
+        benchmark_payload = bench_results[bench_label]
     else:
-        bench_series_single = None
         benchmark_payload = {"mode": "all", "items": bench_results}
 
     return {
         "rebalance_day": int(rebalance_day),
         "start_rebalance_asof": rebalance_dates[0],
         "end_eval_asof": eval_asof,
-        "initial_usd": float(initial_total_usd),
+
+        "initial_total_usd": float(initial_total_usd),
+        "initial_total_krw": float(initial_total_krw),
+
         "total_invested_usd": float(total_invested_usd),
+        "total_invested_krw": float(total_invested_krw),
+
         "final_usd": float(final_usd),
         "final_krw": float(final_krw),
-        "return_pct_vs_total_invested": float(ret_total),
-        "cagr_twr_pct": float(port_cagr),
+
+        "return_pct_usd": float(ret_total_usd),
+        "return_pct_krw": float(ret_total_krw),
+
+        "cagr_twr_pct_usd": float(port_cagr_usd),
+        "cagr_twr_pct_krw": float(port_cagr_krw),
+
         "benchmark_label": bench_label,
         "benchmark": benchmark_payload,
+
         "log": df_log,
-        "port_series": port_series,
-        "bench_series": bench_series_single,         # 단일 모드만
-        "bench_series_map": bench_series_map,         # 단일/전체 모두
-        "bench_results_map": bench_results,           # 단일/전체 모두
+
+        "port_series_usd": port_series_usd,
+        "port_series_krw": port_series_krw,
+
+        "bench_series_map_usd": bench_series_map_usd,
+        "bench_series_map_krw": bench_series_map_krw,
+
+        "bench_results_map": bench_results,
     }
 
 
@@ -1455,10 +1520,11 @@ elif mode == "Monthly":
 
 else:
     # ======================
-    # Backtest UI (UPDATED)
+    # Backtest UI (UPDATED: return currency selector + benchmark integer-only)
     # ======================
     st.header("Backtest")
 
+    # ✅ 5칸: Start / End / Benchmark / Return CCY / Rebalance day
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         bt_start_ym = st.text_input(
@@ -1473,15 +1539,15 @@ else:
             key="bt_end_in",
         )
     with c3:
-        # ✅ 변경: All benchmarks 옵션 추가
         bench_options = [BT_ALL_BENCH_LABEL] + list(BT_BENCHMARKS.keys())
         default_bench = st.session_state.get("bt_bench", "S&P 500 (SPY) [USD]")
         idx = bench_options.index(default_bench) if default_bench in bench_options else 1
         bt_bench = st.selectbox("Benchmark", options=bench_options, index=idx, key="bt_bench")
     with c4:
-        bt_fractional = st.selectbox("Benchmark fractional shares", options=["Yes", "No"], index=0, key="bt_fractional")
+        # ✅ NEW: 수익률/성과 계산 통화
+        bt_ret_ccy = st.selectbox("Return currency", options=["USD", "KRW"], index=0, key="bt_ret_ccy")
     with c5:
-        # ✅ NEW: 리밸런싱일 선택
+        # ✅ 리밸런싱일 선택
         bt_reb_day = st.number_input(
             "Rebalance day of month (1~31)",
             min_value=1,
@@ -1501,6 +1567,9 @@ else:
     with r4:
         bt_add_usd = money_input_en("Monthly add USD", key="bt_add_usd", default=0, allow_decimal=True)
 
+    # ✅ fractional 버튼 삭제: 벤치마크는 무조건 정수 매수
+    st.caption("Benchmark shares: integer-only (fractional disabled).")
+
     run_bt = st.button("Run Backtest", type="primary", use_container_width=True)
 
     if run_bt:
@@ -1514,7 +1583,6 @@ else:
                     monthly_add_krw=float(bt_add_krw),
                     monthly_add_usd=float(bt_add_usd),
                     bench_label=bt_bench,
-                    bench_fractional=(bt_fractional == "Yes"),
                     rebalance_day=int(bt_reb_day),
                 )
             st.session_state["backtest_result"] = out
@@ -1525,49 +1593,75 @@ else:
     if "backtest_result" in st.session_state:
         out = st.session_state["backtest_result"]
 
+        # ✅ 현재 UI 선택(USD/KRW)에 따라 보여줄 값 선택
+        ret_ccy = st.session_state.get("bt_ret_ccy", "USD")
+        if ret_ccy == "USD":
+            total_invested = float(out["total_invested_usd"])
+            final_value = float(out["final_usd"])
+            ret_pct = float(out["return_pct_usd"])
+            cagr = float(out["cagr_twr_pct_usd"])
+            money_label = "USD"
+            invested_str = f"${total_invested:,.2f}"
+            final_str = f"${final_value:,.2f}"
+        else:
+            total_invested = float(out["total_invested_krw"])
+            final_value = float(out["final_krw"])
+            ret_pct = float(out["return_pct_krw"])
+            cagr = float(out["cagr_twr_pct_krw"])
+            money_label = "KRW"
+            invested_str = f"₩{total_invested:,.0f}"
+            final_str = f"₩{final_value:,.0f}"
+
         a, b, c, d, e0 = st.columns(5)
         a.metric("Rebalance day", f"{int(out.get('rebalance_day', 10))}")
         b.metric("Start rebalance (asof)", str(pd.to_datetime(out["start_rebalance_asof"]).date()))
         c.metric("End eval (asof)", str(pd.to_datetime(out["end_eval_asof"]).date()))
-        d.metric("Total invested (USD)", f"${out['total_invested_usd']:,.2f}")
-        e0.metric("Final (USD)", f"${out['final_usd']:,.2f}")
+        d.metric(f"Total invested ({money_label})", invested_str)
+        e0.metric(f"Final ({money_label})", final_str)
 
         e, f, g, h = st.columns(4)
-        e.metric("Final (KRW)", f"₩{out['final_krw']:,.0f}")
-        f.metric("Return vs invested", f"{out['return_pct_vs_total_invested']:.2f}%")
-        g.metric("CAGR (TWR)", f"{out['cagr_twr_pct']:.2f}%")
+        e.metric("Return vs invested", f"{ret_pct:.2f}%")
+        f.metric("CAGR (TWR)", f"{cagr:.2f}%")
 
-        # ✅ 단일/전체 벤치 분기
+        # 벤치 CAGR도 선택 통화로 표시
         if out.get("benchmark_label") != BT_ALL_BENCH_LABEL:
             bench = out["benchmark"]
-            h.metric("Benchmark CAGR (TWR)", f"{bench['cagr_twr_pct']:.2f}%")
+            bench_cagr = float(bench["cagr_twr_pct_usd"] if ret_ccy == "USD" else bench["cagr_twr_pct_krw"])
+            g.metric("Benchmark CAGR (TWR)", f"{bench_cagr:.2f}%")
         else:
-            # All 모드에서는 Best/Worst로 요약
             items = out.get("bench_results_map", {})
-            cagr_list = [(k, float(v.get("cagr_twr_pct", 0.0))) for k, v in items.items()]
+            key = "cagr_twr_pct_usd" if ret_ccy == "USD" else "cagr_twr_pct_krw"
+            cagr_list = [(k, float(v.get(key, 0.0))) for k, v in items.items()]
             cagr_list.sort(key=lambda x: x[1], reverse=True)
             if cagr_list:
                 best_k, best_v = cagr_list[0]
                 worst_k, worst_v = cagr_list[-1]
-                h.metric("Bench best/worst CAGR", f"{best_v:.2f}% / {worst_v:.2f}%")
+                g.metric("Bench best/worst CAGR", f"{best_v:.2f}% / {worst_v:.2f}%")
             else:
-                h.metric("Bench best/worst CAGR", "-")
+                g.metric("Bench best/worst CAGR", "-")
 
-        port_series = out["port_series"].copy()
+        # 참고용(반대 통화도 같이 보여줌)
+        other_ccy = "KRW" if ret_ccy == "USD" else "USD"
+        other_ret = float(out["return_pct_krw"] if ret_ccy == "USD" else out["return_pct_usd"])
+        other_cagr = float(out["cagr_twr_pct_krw"] if ret_ccy == "USD" else out["cagr_twr_pct_usd"])
+        h.metric(f"({other_ccy}) Return/CAGR", f"{other_ret:.2f}% / {other_cagr:.2f}%")
 
-        # ✅ 차트: 단일이면 PORT + BENCH, All이면 PORT + 4 BENCH
+        # ✅ 차트: 선택 통화 기준으로 PORT + BENCH(또는 All)
+        port_series = (out["port_series_usd"] if ret_ccy == "USD" else out["port_series_krw"]).copy()
+
         series_map = {"PORT": port_series}
 
         if out.get("benchmark_label") != BT_ALL_BENCH_LABEL:
-            bench_series = out["bench_series"].copy() if out.get("bench_series") is not None else None
-            if bench_series is not None:
-                series_map["BENCH"] = bench_series
+            bench_map = out["bench_series_map_usd"] if ret_ccy == "USD" else out["bench_series_map_krw"]
+            bs = bench_map.get(out.get("benchmark_label"))
+            if bs is not None:
+                series_map["BENCH"] = bs.copy()
         else:
-            for label, s in out.get("bench_series_map", {}).items():
-                # legend 너무 길면 축약(괄호 앞까지만)
+            bench_map = out["bench_series_map_usd"] if ret_ccy == "USD" else out["bench_series_map_krw"]
+            for label, s in bench_map.items():
                 short = label.split(" (")[0]
-                key = f"BENCH: {short}"
-                series_map[key] = s
+                key2 = f"BENCH: {short}"
+                series_map[key2] = s.copy()
 
         df_chart = pd.concat([v.rename(k) for k, v in series_map.items()], axis=1).dropna()
 
@@ -1590,28 +1684,43 @@ else:
             )
             st.altair_chart(chart, use_container_width=True)
 
-        # ✅ All 모드일 때 벤치마크 성과표 추가
+        # ✅ All 모드일 때 벤치마크 성과표 (선택 통화 기준)
         if out.get("benchmark_label") == BT_ALL_BENCH_LABEL:
             items = out.get("bench_results_map", {})
             if items:
                 rows = []
                 for label, v in items.items():
-                    rows.append(
-                        {
-                            "Benchmark": label,
-                            "CAGR (TWR) %": float(v.get("cagr_twr_pct", 0.0)),
-                            "Return vs invested %": float(v.get("return_pct_vs_total_invested", 0.0)),
-                            "Final (USD)": float(v.get("final_usd", 0.0)),
-                            "Ticker": v.get("ticker", ""),
-                            "CCY": v.get("ccy", ""),
-                        }
-                    )
+                    if ret_ccy == "USD":
+                        rows.append(
+                            {
+                                "Benchmark": label,
+                                "CAGR (TWR) %": float(v.get("cagr_twr_pct_usd", 0.0)),
+                                "Return vs invested %": float(v.get("return_pct_usd", 0.0)),
+                                "Final (USD)": float(v.get("final_usd", 0.0)),
+                                "Ticker": v.get("ticker", ""),
+                                "Native CCY": v.get("native_ccy", ""),
+                            }
+                        )
+                    else:
+                        rows.append(
+                            {
+                                "Benchmark": label,
+                                "CAGR (TWR) %": float(v.get("cagr_twr_pct_krw", 0.0)),
+                                "Return vs invested %": float(v.get("return_pct_krw", 0.0)),
+                                "Final (KRW)": float(v.get("final_krw", 0.0)),
+                                "Ticker": v.get("ticker", ""),
+                                "Native CCY": v.get("native_ccy", ""),
+                            }
+                        )
+
                 df_b = pd.DataFrame(rows).sort_values("CAGR (TWR) %", ascending=False, ignore_index=True)
                 with st.expander("Benchmarks (All) - summary", expanded=True):
                     showb = df_b.copy()
                     showb["CAGR (TWR) %"] = showb["CAGR (TWR) %"].map(lambda x: f"{x:.2f}%")
                     showb["Return vs invested %"] = showb["Return vs invested %"].map(lambda x: f"{x:.2f}%")
-                    showb["Final (USD)"] = showb["Final (USD)"].map(lambda x: f"{x:,.2f}")
+                    for col in ["Final (USD)", "Final (KRW)"]:
+                        if col in showb.columns:
+                            showb[col] = showb[col].map(lambda x: f"{x:,.2f}" if ret_ccy == "USD" else f"{x:,.0f}")
                     st.dataframe(showb, use_container_width=True, hide_index=True)
 
         df_log = out["log"].copy()
@@ -1639,19 +1748,29 @@ else:
             use_container_width=True,
         )
 
-        # ✅ summary JSON: 단일/전체 모두 담기
+        # ✅ summary JSON: USD/KRW 둘 다 담기
         summary_payload = {
             "rebalance_day": int(out.get("rebalance_day", 10)),
             "start_rebalance_asof": str(pd.to_datetime(out["start_rebalance_asof"]).date()),
             "end_eval_asof": str(pd.to_datetime(out["end_eval_asof"]).date()),
+
             "total_invested_usd": out["total_invested_usd"],
+            "total_invested_krw": out["total_invested_krw"],
+
             "final_usd": out["final_usd"],
             "final_krw": out["final_krw"],
-            "return_pct_vs_total_invested": out["return_pct_vs_total_invested"],
-            "cagr_twr_pct": out["cagr_twr_pct"],
+
+            "return_pct_usd": out["return_pct_usd"],
+            "return_pct_krw": out["return_pct_krw"],
+
+            "cagr_twr_pct_usd": out["cagr_twr_pct_usd"],
+            "cagr_twr_pct_krw": out["cagr_twr_pct_krw"],
+
             "benchmark_label": out.get("benchmark_label"),
             "benchmark": out.get("benchmark"),
             "bench_results_map": out.get("bench_results_map"),
+
+            "benchmark_integer_only": True,
         }
         st.download_button(
             "Download summary (JSON)",
