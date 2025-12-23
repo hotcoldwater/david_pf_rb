@@ -2,6 +2,9 @@ import json
 import hashlib
 import math
 import calendar
+import io
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 from datetime import datetime, timedelta
 
 import altair as alt
@@ -159,6 +162,46 @@ def money_input_en(
 
 
 # ======================
+# Robust FRED CSV loader (BOM/whitespace/HTML guard)
+# ======================
+def _fred_csv(url: str) -> pd.DataFrame:
+    """
+    Robust CSV loader for FRED.
+    - Strips BOM/whitespace in headers
+    - Detects HTML response (blocked) early
+    """
+    text = None
+    try:
+        req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=20) as resp:
+            raw = resp.read()
+        # decode (ignore errors)
+        text = raw.decode("utf-8", errors="ignore")
+        if "<html" in (text or "").lower():
+            raise RuntimeError("FRED returned HTML instead of CSV.")
+        df = pd.read_csv(io.StringIO(text))
+    except Exception:
+        # fallback
+        df = pd.read_csv(url)
+
+    df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
+    return df
+
+
+def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cols = {str(c).strip().lstrip("\ufeff").lower(): c for c in df.columns}
+    for cand in candidates:
+        key = cand.lower()
+        if key in cols:
+            return cols[key]
+    for c in df.columns:
+        cl = str(c).lower()
+        if any(cand.lower() in cl for cand in candidates):
+            return c
+    return None
+
+
+# ======================
 # yfinance / FRED (캐시)
 # ======================
 @st.cache_data(ttl=900, show_spinner=False)
@@ -249,23 +292,27 @@ def fx_usdkrw() -> float:
 @st.cache_data(ttl=3600, show_spinner=False)
 def _unrate_info(today: datetime):
     """
-    ✅ pandas_datareader 없이 FRED(UNRATE) 가져오기 (Python 3.12 호환)
+    ✅ FRED(UNRATE) robust fetch (BOM/whitespace/HTML guard)
     """
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=UNRATE"
-    df = pd.read_csv(url)
+    df = _fred_csv(url)
 
-    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
-    df["UNRATE"] = pd.to_numeric(df["UNRATE"], errors="coerce")
-    df = df.dropna(subset=["DATE", "UNRATE"])
+    date_col = _pick_col(df, ["DATE", "observation_date"])
+    val_col = _pick_col(df, ["UNRATE"])
+    if not date_col or not val_col:
+        raise RuntimeError("UNRATE columns not found")
+
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+    df = df.dropna(subset=[date_col, val_col])
 
     start = today - timedelta(days=400)
-    df = df[(df["DATE"] >= start) & (df["DATE"] <= today)].copy()
-
+    df = df[(df[date_col] >= start) & (df[date_col] <= today)].copy()
     if df.empty:
         raise RuntimeError("UNRATE 데이터가 비어있음")
 
-    unrate_now = float(df["UNRATE"].iloc[-1])
-    unrate_ma = float(df["UNRATE"].tail(12).mean())  # 최근 12개월 평균
+    unrate_now = float(df[val_col].iloc[-1])
+    unrate_ma = float(df[val_col].tail(12).mean())  # 최근 12개월 평균
     return unrate_now, unrate_ma
 
 
@@ -556,7 +603,6 @@ def render_execution_editor(result: dict, editor_prefix: str):
     for strat in ["VAA", "LAA", "ODM"]:
         rec = result[strat]["holdings"]
 
-        # ✅ FIX: expander 제목/expanded 인자를 분리해서 정상 사용
         with st.expander(strat, expanded=(strat == "VAA")):
             cols = st.columns(5)
             for i, t in enumerate(INPUT_TICKERS):
@@ -770,7 +816,6 @@ def bt_download_adj_close(tickers: tuple, start_str: str, end_str: str) -> pd.Da
                 except Exception:
                     continue
     else:
-        # single ticker fallback
         col = "Adj Close" if "Adj Close" in df.columns else "Close"
         out[list(tickers)[0]] = df[col]
 
@@ -782,8 +827,7 @@ def bt_download_adj_close(tickers: tuple, start_str: str, end_str: str) -> pd.Da
     except Exception:
         pass
 
-    adj = adj.sort_index()
-    return adj
+    return adj.sort_index()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -792,21 +836,28 @@ def bt_unrate_series(start_str: str, end_str: str) -> pd.Series:
     end = datetime.strptime(end_str, "%Y-%m-%d")
 
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=UNRATE"
-    df = pd.read_csv(url)
-    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
-    df["UNRATE"] = pd.to_numeric(df["UNRATE"], errors="coerce")
-    df = df.dropna(subset=["DATE", "UNRATE"])
+    df = _fred_csv(url)
 
-    df = df[(df["DATE"] >= (start - timedelta(days=30))) & (df["DATE"] <= (end + timedelta(days=30)))].copy()
-    s = df.set_index("DATE")["UNRATE"]
+    date_col = _pick_col(df, ["DATE", "observation_date"])
+    val_col = _pick_col(df, ["UNRATE"])
+
+    # 못 찾으면 빈 시리즈 반환 (LAA safe는 자동으로 QQQ로 fallback)
+    if not date_col or not val_col:
+        return pd.Series(dtype=float)
+
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
+    df = df.dropna(subset=[date_col, val_col])
+
+    df = df[(df[date_col] >= (start - timedelta(days=30))) & (df[date_col] <= (end + timedelta(days=30)))].copy()
+    s = df.set_index(date_col)[val_col]
     s.index = pd.to_datetime(s.index)
     try:
         if getattr(s.index, "tz", None) is not None:
             s.index = s.index.tz_localize(None)
     except Exception:
         pass
-    s = s.sort_index()
-    return s
+    return s.sort_index()
 
 
 def bt_px_on_or_before(prices_ff: pd.DataFrame, asof: pd.Timestamp, t: str) -> float:
@@ -893,6 +944,9 @@ def bt_buy_equal_split_min_cash(assets: list, budget_usd: float, px_map: dict):
 
 def bt_safe_laa_asset(asof: pd.Timestamp, prices_ff: pd.DataFrame, unrate: pd.Series):
     try:
+        if unrate is None or unrate.empty:
+            return "QQQ"
+
         unrate_now = float(unrate.loc[:asof].iloc[-1])
         tail12 = unrate.loc[:asof].tail(12)
         if len(tail12) < 12:
@@ -1025,6 +1079,7 @@ def bt_run_backtest(
     monthly_add_krw: float,
     monthly_add_usd: float,
     bench_label: str,
+    bench_fractional: bool,
 ):
     start_month = bt_parse_start_month(start_month_ym)
     end_date = bt_parse_end_date(end_date_in)
@@ -1054,13 +1109,11 @@ def bt_run_backtest(
 
     prices_ff = prices_raw.reindex(trading_index).ffill()
 
-    # benchmark series
     if bench_ticker not in prices_all.columns:
         raise RuntimeError("Missing benchmark price data.")
     bench_raw = prices_all[[bench_ticker]].copy()
     bench_ff = bench_raw.reindex(trading_index).ffill()
 
-    # UNRATE(FRED) via CSV
     unrate = bt_unrate_series(
         start_str=data_start.strftime("%Y-%m-%d"),
         end_str=data_end.strftime("%Y-%m-%d"),
@@ -1101,25 +1154,20 @@ def bt_run_backtest(
             for k in ["VAA", "LAA", "ODM"]:
                 budgets[k] = value_of(state[k]["holdings"], asof) + float(state[k]["cash"]) + add_each
 
-        # VAA: pick best among VAA_UNIVERSE (7 tickers, same as webapp)
         scores = {t: bt_momentum_score(asof, prices_ff, t) for t in VAA_UNIVERSE}
         best_vaa = max(scores, key=scores.get)
         vaa_hold, vaa_cash = bt_buy_all_in_if_affordable(best_vaa, budgets["VAA"], px_map[best_vaa])
 
-        # LAA
         laa_safe = bt_safe_laa_asset(asof, prices_ff, unrate)
         laa_assets = ["IWD", "IEF", "GLD", laa_safe]
         laa_hold, laa_cash = bt_buy_equal_split_min_cash(laa_assets, budgets["LAA"], px_map)
 
-        # ODM
         odm_asset = bt_odm_choice(asof, prices_ff)
         odm_hold, odm_cash = bt_buy_all_in_if_affordable(odm_asset, budgets["ODM"], px_map[odm_asset])
 
         state["VAA"] = {"holdings": vaa_hold, "cash": vaa_cash, "picked": best_vaa}
         state["LAA"] = {"holdings": laa_hold, "cash": laa_cash, "safe": laa_safe}
         state["ODM"] = {"holdings": odm_hold, "cash": odm_cash, "picked": odm_asset}
-
-        return scores  # optional
 
     logs = []
     port_events = []  # (date, pre_value_usd, post_value_usd)
@@ -1162,7 +1210,6 @@ def bt_run_backtest(
 
     port_events.append((eval_asof, float(final_usd), None))
 
-    # total invested (USD)
     total_added_usd = 0.0
     for row in logs:
         if int(row["month_idx"]) == 0:
@@ -1176,7 +1223,6 @@ def bt_run_backtest(
 
     df_log = pd.DataFrame(logs)
 
-    # benchmark
     bench_events = bt_simulate_benchmark_events(
         ticker=bench_ticker,
         ccy=bench_ccy,
@@ -1187,13 +1233,12 @@ def bt_run_backtest(
         initial_total_usd=float(initial_total_usd),
         monthly_add_krw=float(monthly_add_krw),
         monthly_add_usd=float(monthly_add_usd),
-        fractional=True,
+        fractional=bool(bench_fractional),
     )
     bench_final_usd = float(bench_events[-1][1])
     bench_ret = (bench_final_usd / total_invested_usd - 1) * 100 if total_invested_usd > 0 else 0.0
     bench_cagr = bt_compute_twr_cagr(port_events=bench_events, start_date=rebalance_dates[0], end_date=eval_asof)
 
-    # series for chart (rebalance post values + end value)
     port_points = [(row["asof"], float(row["total_usd"])) for _, row in df_log.iterrows()]
     port_points.append((eval_asof, float(final_usd)))
     port_series = pd.Series([v for _, v in port_points], index=pd.to_datetime([d for d, _ in port_points]))
@@ -1215,6 +1260,7 @@ def bt_run_backtest(
             "label": bench_label,
             "ticker": bench_ticker,
             "ccy": bench_ccy,
+            "fractional": bool(bench_fractional),
             "final_usd": float(bench_final_usd),
             "return_pct_vs_total_invested": float(bench_ret),
             "cagr_twr_pct": float(bench_cagr),
@@ -1257,7 +1303,6 @@ if mode == "Annual":
         except Exception as e:
             st.error(str(e))
 
-    # 결과가 있으면 표시 + 실행본 편집 + 저장
     if "annual_result" in st.session_state:
         result = st.session_state["annual_result"]
         current_holdings = {t: int(amounts.get(t, 0)) for t in INPUT_TICKERS}
@@ -1286,7 +1331,6 @@ elif mode == "Monthly":
     raw_bytes = uploaded.getvalue()
     file_sig = hashlib.md5(raw_bytes).hexdigest()
 
-    # 파일 바뀌면 월간 결과/편집키 초기화
     if st.session_state.get("monthly_file_sig") != file_sig:
         st.session_state["monthly_file_sig"] = file_sig
         if "monthly_result" in st.session_state:
@@ -1299,7 +1343,6 @@ elif mode == "Monthly":
         st.error("업로드 파일이 JSON 파싱에 실패했어. (파일 깨짐/형식 오류)")
         st.stop()
 
-    # 최소 요구: VAA/LAA/ODM + holdings
     for k in ["VAA", "LAA", "ODM"]:
         if k not in prev_raw or "holdings" not in prev_raw[k]:
             st.error("이 JSON은 예상 형식이 아니야. (VAA/LAA/ODM 안에 holdings가 필요)")
@@ -1310,7 +1353,6 @@ elif mode == "Monthly":
     st.subheader("현금($)")
     cash_usd = money_input("현금($)", key="m_cash_usd", default=0, allow_decimal=True)
 
-    # 이전 실행본 요약(선택)
     with st.expander("Previous", expanded=False):
         merged_prev = merge_holdings(prev["VAA"]["holdings"], prev["LAA"]["holdings"], prev["ODM"]["holdings"])
         items = [(t, int(q)) for t, q in merged_prev.items() if int(q) != 0]
@@ -1329,7 +1371,7 @@ elif mode == "Monthly":
             with st.spinner("Calculating..."):
                 result = run_month(prev, cash_usd)
             st.session_state["monthly_result"] = result
-            _clear_keys_with_prefix("exec_monthly_")  # 새 추천안이면 실행본 편집 초기화
+            _clear_keys_with_prefix("exec_monthly_")
             st.success("Completed")
         except Exception as e:
             st.error(str(e))
@@ -1360,7 +1402,11 @@ else:
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        bt_start_ym = st.text_input("Start month (YYYY-MM)", value=st.session_state.get("bt_start_ym", "2000-01"), key="bt_start_ym")
+        bt_start_ym = st.text_input(
+            "Start month (YYYY-MM)",
+            value=st.session_state.get("bt_start_ym", "2000-01"),
+            key="bt_start_ym",
+        )
     with c2:
         bt_end_in = st.text_input(
             "End date (YYYY-MM-DD or YYYY-MM)",
@@ -1402,6 +1448,7 @@ else:
                     monthly_add_krw=float(bt_add_krw),
                     monthly_add_usd=float(bt_add_usd),
                     bench_label=bt_bench,
+                    bench_fractional=(bt_fractional == "Yes"),
                 )
             st.session_state["backtest_result"] = out
             st.success("Completed")
@@ -1424,7 +1471,6 @@ else:
         g.metric("CAGR (TWR)", f"{out['cagr_twr_pct']:.2f}%")
         h.metric("Benchmark CAGR (TWR)", f"{bench['cagr_twr_pct']:.2f}%")
 
-        # Chart: normalized compare
         port_series = out["port_series"].copy()
         bench_series = out["bench_series"].copy()
 
@@ -1432,6 +1478,7 @@ else:
             [port_series.rename("PORT"), bench_series.rename("BENCH")],
             axis=1,
         ).dropna()
+
         if not df_chart.empty:
             df_chart = df_chart / df_chart.iloc[0]
             df_chart = df_chart.reset_index().rename(columns={"index": "Date"})
@@ -1450,7 +1497,6 @@ else:
             )
             st.altair_chart(chart, use_container_width=True)
 
-        # Logs
         df_log = out["log"].copy()
         with st.expander("Log (last 6)", expanded=True):
             show = df_log.tail(6).copy()
@@ -1468,7 +1514,6 @@ else:
             tmp["asof"] = pd.to_datetime(tmp["asof"])
             st.dataframe(tmp, use_container_width=True, hide_index=True)
 
-        # Downloads
         st.download_button(
             "Download log (CSV)",
             data=df_log.to_csv(index=False).encode("utf-8"),
