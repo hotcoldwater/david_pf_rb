@@ -24,6 +24,10 @@ INPUT_TICKERS = [t for t in TICKER_LIST if t != "BIL"]
 # ✅ VAA 모멘텀 표기(7개) + 선택도 7개 중에서
 VAA_UNIVERSE = ["SPY", "EFA", "EEM", "AGG", "LQD", "IEF", "SHY"]
 
+# ✅ VAA 룰 분기(리스크온/디펜시브)
+VAA_RISK_ON = ["SPY", "EFA", "EEM", "AGG"]
+VAA_DEFENSIVE = ["LQD", "IEF", "SHY"]
+
 st.set_page_config(page_title="Rebalance (Private)", layout="wide")
 st.title("PORTFOLIO")
 
@@ -454,6 +458,17 @@ def vaa_scores_df(vaa: dict) -> pd.DataFrame:
     return df
 
 
+def pick_vaa_asset(scores: dict) -> str:
+    """
+    ✅ 네가 말한 VAA 룰:
+    - SPY/EFA/EEM/AGG 모멘텀스코어가 모두 > 0 이면: 그 4개 중 1등 올인
+    - 아니면: LQD/IEF/SHY 중 1등 올인
+    """
+    risk_ok = all(float(scores.get(t, -9999)) > 0 for t in VAA_RISK_ON)
+    universe = VAA_RISK_ON if risk_ok else VAA_DEFENSIVE
+    return max(universe, key=lambda t: float(scores.get(t, -9999)))
+
+
 # ======================
 # 결과 표시(UI 정리 버전)
 # ======================
@@ -643,7 +658,7 @@ def run_year(amounts: dict, cash_usd: float):
     budget = float(total_usd) / 3.0
 
     scores = compute_vaa_scores(prices)
-    best_vaa = max(scores, key=scores.get)
+    best_vaa = pick_vaa_asset(scores)  # ✅ FIXED
     vaa_hold, vaa_cash_usd = buy_all_in_if_affordable(best_vaa, budget, prices)
 
     laa_safe = safe_laa_asset(today, prices)
@@ -679,7 +694,7 @@ def run_month(prev: dict, cash_usd: float):
     odm_budget = strategy_value_holdings(odm_prev_hold, prices) + cash_each
 
     scores = compute_vaa_scores(prices)
-    best_vaa = max(scores, key=scores.get)
+    best_vaa = pick_vaa_asset(scores)  # ✅ FIXED
     vaa_hold, vaa_cash_usd = buy_all_in_if_affordable(best_vaa, vaa_budget, prices)
 
     laa_safe = safe_laa_asset(today, prices)
@@ -1177,7 +1192,7 @@ def bt_run_backtest(
                 budgets[k] = value_of(state[k]["holdings"], asof) + float(state[k]["cash"]) + add_each
 
         scores = {t: bt_momentum_score(asof, prices_ff, t) for t in VAA_UNIVERSE}
-        best_vaa = max(scores, key=scores.get)
+        best_vaa = pick_vaa_asset(scores)  # ✅ FIXED (same rule)
         vaa_hold, vaa_cash = bt_buy_all_in_if_affordable(best_vaa, budgets["VAA"], px_map[best_vaa])
 
         laa_safe = bt_safe_laa_asset(asof, prices_ff, unrate)
