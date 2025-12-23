@@ -23,6 +23,43 @@ st.title("PORTFOLIO")
 
 
 # ======================
+# 상단 모드 버튼 (사이드바 제거 버전)
+# ======================
+def _set_mode(m: str):
+    st.session_state["mode"] = m
+
+
+if "mode" not in st.session_state:
+    st.session_state["mode"] = "Monthly"
+
+mode = st.session_state["mode"]
+
+c_m, c_a, c_sp, c_r = st.columns([1.4, 1.4, 6.2, 1.4])
+with c_m:
+    st.button(
+        "Monthly",
+        type="primary" if mode == "Monthly" else "secondary",
+        use_container_width=True,
+        on_click=_set_mode,
+        args=("Monthly",),
+    )
+with c_a:
+    st.button(
+        "Annual",
+        type="primary" if mode == "Annual" else "secondary",
+        use_container_width=True,
+        on_click=_set_mode,
+        args=("Annual",),
+    )
+with c_r:
+    if st.button("Refresh", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+st.divider()
+
+
+# ======================
 # 숫자 입력(콤마 표기) 유틸
 # ======================
 def parse_money(text: str, allow_decimal: bool) -> float:
@@ -325,11 +362,6 @@ def vaa_scores_df(vaa: dict) -> pd.DataFrame:
 # 결과 표시(UI 정리 버전)
 # ======================
 def show_result(result: dict, current_holdings: dict, layout: str = "side"):
-    """
-    layout:
-      - "side": 좌/우로(연간 스샷처럼): 오른쪽에 모멘텀 막대그래프
-      - "stack": 위->아래
-    """
     rate = float(result["meta"]["usdkrw_rate"])
     price_map = result["meta"]["prices_adj_close"]
 
@@ -442,18 +474,6 @@ def show_result(result: dict, current_holdings: dict, layout: str = "side"):
 
 
 # ======================
-# 사이드바: 모드 + 캐시리셋
-# ======================
-with st.sidebar:
-    st.subheader("_____________________")
-    mode = st.radio("REBALANCING", ["Monthly", "Annual"], index=0)
-
-    if st.button("Refresh"):
-        st.cache_data.clear()
-        st.rerun()
-
-
-# ======================
 # 날짜 기준
 # ======================
 today = datetime.today()
@@ -477,9 +497,6 @@ def compute_vaa_scores(prices: dict) -> dict:
 
 
 def run_year(amounts: dict, cash_usd: float):
-    """
-    ✅ 입력 현금은 USD 하나 (UI에선 보유자산 섹션에 포함)
-    """
     total_usd = sum(float(amounts.get(t, 0.0)) * float(prices[t]) for t in INPUT_TICKERS) + float(cash_usd)
     budget = float(total_usd) / 3.0
 
@@ -494,7 +511,7 @@ def run_year(amounts: dict, cash_usd: float):
     odm_asset = odm_choice(prices, d_12m)
     odm_hold, odm_cash_usd = buy_all_in_if_affordable(odm_asset, budget, prices)
 
-    result = {
+    return {
         "timestamp": today.strftime("%Y-%m-%d %H:%M:%S"),
         "meta": {
             "usdkrw_rate": float(usdkrw_rate),
@@ -506,16 +523,9 @@ def run_year(amounts: dict, cash_usd: float):
         "LAA": {"holdings": laa_hold, "cash_usd": float(laa_cash_usd), "safe": laa_safe},
         "ODM": {"holdings": odm_hold, "cash_usd": float(odm_cash_usd), "picked": odm_asset},
     }
-    return result
 
 
 def run_month(prev: dict, cash_usd: float):
-    """
-    ✅ 월간 리밸런싱(최종안)
-    - 전략별 총액 = 그 전략이 보유한 ETF 평가금액만
-    - 입력 cash_usd는 항상 1/3씩 분배
-    - prev[strat]['cash_usd'] 는 계산에 사용하지 않음
-    """
     cash_each = float(cash_usd) / 3.0
 
     vaa_prev_hold = prev["VAA"]["holdings"]
@@ -537,7 +547,7 @@ def run_month(prev: dict, cash_usd: float):
     odm_asset = odm_choice(prices, d_12m)
     odm_hold, odm_cash_usd = buy_all_in_if_affordable(odm_asset, odm_budget, prices)
 
-    result = {
+    return {
         "timestamp": today.strftime("%Y-%m-%d %H:%M:%S"),
         "meta": {
             "usdkrw_rate": float(usdkrw_rate),
@@ -549,7 +559,6 @@ def run_month(prev: dict, cash_usd: float):
         "LAA": {"holdings": laa_hold, "cash_usd": float(laa_cash_usd), "safe": laa_safe},
         "ODM": {"holdings": odm_hold, "cash_usd": float(odm_cash_usd), "picked": odm_asset},
     }
-    return result
 
 
 # ======================
@@ -558,12 +567,10 @@ def run_month(prev: dict, cash_usd: float):
 if mode.startswith("Annual"):
     st.header("Annual Rebalancing")
 
-    # ✅ 현금을 "보유자산(주)" 섹션 안에 한 항목으로 포함
     st.subheader("보유자산")
     amounts = {}
     cash_usd = 0.0
 
-    # 티커 입력 + CASH($)를 같은 그리드에 배치
     fields = INPUT_TICKERS + ["CASH($)"]
     cols = st.columns(4)
 
@@ -613,7 +620,6 @@ else:
 
     prev = json.loads(json.dumps(prev_raw))  # deep copy
 
-    # ✅ '보유자산(주)' 섹션 안에 CASH($)도 같이 포함(별도 섹션으로 빼지 않음)
     st.subheader("보유자산")
 
     edit_prev = st.checkbox("정보수정", value=False)
@@ -623,7 +629,6 @@ else:
             with st.expander(f"{strat}", expanded=False):
                 existing_hold = prev[strat].get("holdings", {})
 
-                # INPUT_TICKERS 외 티커는 기본 유지(단, BIL은 제거)
                 preserved = {t: int(q) for t, q in existing_hold.items() if t not in INPUT_TICKERS and t != "BIL"}
 
                 new_hold = {}
@@ -640,7 +645,6 @@ else:
                 merged.update(new_hold)
                 prev[strat]["holdings"] = merged
 
-    # ✅ CASH($)도 보유자산 섹션 안의 "한 항목"으로 배치 (별도 subheader 없음)
     cols_cash = st.columns(4)
     with cols_cash[0]:
         cash_usd = money_input("현금($)", key="m_cash_usd", default=0, allow_decimal=True)
@@ -653,7 +657,6 @@ else:
             st.success("Completed")
 
             current_holdings = merge_holdings(prev["VAA"]["holdings"], prev["LAA"]["holdings"], prev["ODM"]["holdings"])
-            # ✅ 월간도 연간 스샷처럼 side 레이아웃으로
             show_result(result, current_holdings, layout="side")
 
             st.download_button(
