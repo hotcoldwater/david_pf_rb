@@ -19,7 +19,7 @@ INPUT_TICKERS = [t for t in TICKER_LIST if t != "BIL"]
 VAA_UNIVERSE = ["SPY", "EFA", "EEM", "AGG", "LQD", "IEF", "SHY"]
 
 st.set_page_config(page_title="Rebalance (Private)", layout="wide")
-st.title("리밸런싱 웹앱 (개인용)")
+st.title("PORTFOLIO")
 
 
 # ======================
@@ -350,9 +350,9 @@ def show_result(result: dict, current_holdings: dict, layout: str = "stack"):
     cash_krw = total_cash_usd * rate
 
     a, b, c = st.columns(3)
-    a.metric("총자산(원)", f"₩{total_krw:,.0f}")
-    b.metric("현금(원)", f"₩{cash_krw:,.0f}")
-    c.metric("달러환율(원/달러)", f"₩{rate:,.2f}")
+    a.metric("총자산(₩)", f"₩{total_krw:,.0f}")
+    b.metric("현금(₩)", f"₩{cash_krw:,.0f}")
+    c.metric("달러환율(₩/달러)", f"₩{rate:,.2f}")
 
     all_target = merge_holdings(vaa_h, laa_h, odm_h)
 
@@ -371,7 +371,7 @@ def show_result(result: dict, current_holdings: dict, layout: str = "stack"):
                 st.metric(t, f"{q}주")
 
     def render_trades_clean():
-        st.subheader("매수/매도 수량")
+        st.subheader("매수/매도")
         rows = []
         for t in sorted(set(current_holdings.keys()) | set(all_target.keys())):
             if t == "BIL":
@@ -442,9 +442,9 @@ def show_result(result: dict, current_holdings: dict, layout: str = "stack"):
 with st.sidebar:
     st.subheader("모드")
     # ✅ 월 리밸런싱이 먼저 뜨도록 (기본값 Month)
-    mode = st.radio("리밸런싱 타입", ["Month (M)", "Year (Y)"], index=0)
+    mode = st.radio("리밸런싱 타입", ["Monthly Rebalancing", "Annual Rebalancing"], index=0)
 
-    if st.button("시장데이터 새로고침(캐시 삭제)"):
+    if st.button("새로고침"):
         st.cache_data.clear()
         st.rerun()
 
@@ -607,7 +607,7 @@ else:
         st.error("이 JSON은 예상 형식이 아니야. (VAA/LAA/ODM/meta 키가 필요)")
         st.stop()
 
-    edit_prev = st.checkbox("업로드된 내용을 수정", value=False)
+    edit_prev = st.checkbox("정보수정", value=False)
     prev = json.loads(json.dumps(prev_raw))  # deep copy
 
     if edit_prev:
@@ -638,26 +638,26 @@ else:
                 prev[strat]["cash_usd"] = float(cash_val)
                 prev[strat]["holdings"] = new_hold
 
-    st.subheader("이번달 추가투자")
+    st.subheader("추가투자금액")
     c1, c2 = st.columns(2)
     with c1:
         krw_add = money_input("이번달 추가투자(₩)", key="m_krw_add", default=0, allow_decimal=False)
     with c2:
         usd_add = money_input("이번달 추가투자($)", key="m_usd_add", default=0, allow_decimal=True)
 
-    if st.button("월 리밸런싱 계산", type="primary"):
+    if st.button("REBALANCE", type="primary"):
         try:
             with st.spinner("계산 중..."):
                 result = run_month(prev, krw_add, usd_add)
 
-            st.success("완료")
+            st.success("Completed")
 
             current_holdings = merge_holdings(prev["VAA"]["holdings"], prev["LAA"]["holdings"], prev["ODM"]["holdings"])
             # ✅ BIL 등 불필요 티커는 show_result에서 자동 제외됨
             show_result(result, current_holdings, layout="stack")
 
             st.download_button(
-                label="✅ 이번달 결과 JSON 다운로드(저장)",
+                label="✅ 결과 다운로드",
                 data=json.dumps(result, indent=2),
                 file_name=f"rebalance_{result['timestamp'].replace(':','-').replace(' ','_')}.json",
                 mime="application/json",
