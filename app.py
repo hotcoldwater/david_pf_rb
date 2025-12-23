@@ -367,10 +367,6 @@ def vaa_scores_df(vaa: dict) -> pd.DataFrame:
 # 결과 표시(UI 정리 버전)
 # ======================
 def show_result(result: dict, current_holdings: dict, layout: str = "side"):
-    """
-    ✅ 여기서는 '추천안(result)' 기반으로만 보여줌.
-    저장은 아래 '실행본 편집'에서 받은 holdings로 따로 저장.
-    """
     rate = float(result["meta"]["usdkrw_rate"])
     price_map = result["meta"]["prices_adj_close"]
 
@@ -404,7 +400,7 @@ def show_result(result: dict, current_holdings: dict, layout: str = "side"):
     all_target = merge_holdings(vaa_h, laa_h, odm_h)
 
     def render_target_clean():
-        st.subheader("목표 보유자산 제안")
+        st.subheader("목표 보유자산")
         items = [(t, int(q)) for t, q in all_target.items() if int(q) != 0 and t != "BIL"]
         items.sort(key=lambda x: x[0])
 
@@ -418,7 +414,7 @@ def show_result(result: dict, current_holdings: dict, layout: str = "side"):
                 st.metric(t, f"{q}주")
 
     def render_trades_clean():
-        st.subheader("BUY/SELL")
+        st.subheader("매도/매수")
         rows = []
         for t in sorted(set(current_holdings.keys()) | set(all_target.keys())):
             if t == "BIL":
@@ -440,19 +436,19 @@ def show_result(result: dict, current_holdings: dict, layout: str = "side"):
 
         left, right = st.columns(2)
         with left:
-            st.markdown("**SELL**")
+            st.markdown("**매도**")
             if not sells:
                 st.write("-")
             else:
                 for t, q in sells:
-                    st.write(f"{t} {q}주 SELL")
+                    st.write(f"{t} {q}주 매도")
         with right:
-            st.markdown("**BUY**")
+            st.markdown("**매입**")
             if not buys:
                 st.write("-")
             else:
                 for t, q in buys:
-                    st.write(f"{t} {q}주 BUY")
+                    st.write(f"{t} {q}주 매입")
 
     def render_scores_bar():
         st.subheader("모멘텀스코어")
@@ -507,24 +503,22 @@ def export_holdings_only(executed: dict, timestamp: str) -> dict:
 
 
 def render_execution_editor(result: dict, editor_prefix: str):
-    """
-    result(추천안)에서 VAA/LAA/ODM holdings를 기본값으로 깔고,
-    사용자가 전략별로 INPUT_TICKERS(10개) 수량을 조정해서 '실행본 holdings'를 만든다.
-    """
     st.subheader("실제 보유자산")
-    st.caption("여기서 네가 실제로 매매한 수량대로 조정하고 저장하면, 다음 달 Monthly에서 수정 없이 그대로 쓸 수 있어. (현금은 저장 안 함)")
 
     executed = {"VAA": {"holdings": {}}, "LAA": {"holdings": {}}, "ODM": {"holdings": {}}}
 
     for strat in ["VAA", "LAA", "ODM"]:
         rec = result[strat]["holdings"]
-        with st.expander(f"{strat} 실행본 수량 조정", expanded=(strat == "VAA")):
+
+        # ✅ FIX: expander 제목/expanded 인자를 분리해서 정상 사용
+        with st.expander(strat, expanded=(strat == "VAA")):
             cols = st.columns(5)
             for i, t in enumerate(INPUT_TICKERS):
                 default_q = int(rec.get(t, 0))
                 key = f"{editor_prefix}{strat}_{t}"
                 with cols[i % 5]:
                     q = st.number_input(t, min_value=0, value=default_q, step=1, key=key)
+
                 if int(q) != 0:
                     executed[strat]["holdings"][t] = int(q)
 
@@ -647,7 +641,7 @@ if mode == "Annual":
                 result = run_year(amounts, cash_usd)
             st.session_state["annual_result"] = result
             _clear_keys_with_prefix("exec_annual_")  # 실행본 편집 키 초기화
-            st.success("완료")
+            st.success("Completed")
         except Exception as e:
             st.error(str(e))
 
@@ -701,7 +695,6 @@ else:
 
     prev = json.loads(json.dumps(prev_raw))  # deep copy
 
-    # ✅ FIX: money_input에는 label이 필수
     st.subheader("현금($)")
     cash_usd = money_input("현금($)", key="m_cash_usd", default=0, allow_decimal=True)
 
