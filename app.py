@@ -582,7 +582,7 @@ if mode.startswith("Annual"):
             else:
                 amounts[f] = st.number_input(f, min_value=0, value=0, step=1, key=f"y_amt_{f}")
 
-    if st.button("리밸런싱 계산", type="primary"):
+    if st.button("Rebalance", type="primary"):
         try:
             with st.spinner("계산 중..."):
                 result = run_year(amounts, cash_usd)
@@ -604,7 +604,7 @@ if mode.startswith("Annual"):
 else:
     st.header("Monthly Rebalancing")
 
-    uploaded = st.file_uploader("파일 업로드", type=["json"])
+    uploaded = st.file_uploader("File Upload", type=["json"])
     if not uploaded:
         st.stop()
 
@@ -621,9 +621,9 @@ else:
 
     prev = json.loads(json.dumps(prev_raw))  # deep copy
 
-    st.subheader("보유자산")
+    st.subheader("Assets")
 
-    edit_prev = st.checkbox("정보수정", value=False)
+    edit_prev = st.checkbox("Changes", value=False)
 
     if edit_prev:
         for strat in ["VAA", "LAA", "ODM"]:
