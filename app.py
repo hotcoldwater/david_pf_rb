@@ -549,7 +549,7 @@ def run_month(prev: dict, krw_add: float, usd_add: float):
 # ======================
 # 화면: Month / Year
 # ======================
-if mode.startswith("Year"):
+if mode.startswith("Annual Rebalancing"):
     st.header("Year (Y)")
 
     st.subheader("현재 보유 수량(주)")
@@ -590,9 +590,9 @@ if mode.startswith("Year"):
             st.error(str(e))
 
 else:
-    st.header("Month (M)")
+    st.header("Monthly Rebalancing")
 
-    uploaded = st.file_uploader("이전 결과 JSON 업로드", type=["json"])
+    uploaded = st.file_uploader("파일 업로드", type=["json"])
     if not uploaded:
         st.stop()
 
