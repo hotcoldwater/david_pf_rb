@@ -619,7 +619,7 @@ def run_month(prev: dict, cash_usd: float):
 if mode == "Annual":
     st.header("Annual Rebalancing")
 
-    st.subheader("Assets (현재 보유 수량)")
+    st.subheader("Assets")
     amounts = {}
 
     # ✅ 10개 티커 + 현금 = 11개 → 6칸 그리드
