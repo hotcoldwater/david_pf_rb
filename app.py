@@ -1,5 +1,7 @@
 import json
 import hashlib
+import math
+import calendar
 from datetime import datetime, timedelta
 
 import altair as alt
@@ -35,7 +37,8 @@ if "mode" not in st.session_state:
 
 mode = st.session_state["mode"]
 
-c_m, c_a, c_sp, c_r = st.columns([1.4, 1.4, 6.2, 1.4])
+# ✅ Backtest 버튼 추가 (Monthly/Annual 최대한 유지)
+c_m, c_a, c_b, c_sp, c_r = st.columns([1.4, 1.4, 1.4, 4.8, 1.4])
 with c_m:
     st.button(
         "Monthly",
@@ -52,12 +55,29 @@ with c_a:
         on_click=_set_mode,
         args=("Annual",),
     )
+with c_b:
+    st.button(
+        "Backtest",
+        type="primary" if mode == "Backtest" else "secondary",
+        use_container_width=True,
+        on_click=_set_mode,
+        args=("Backtest",),
+    )
 with c_r:
     if st.button("Refresh", use_container_width=True):
         st.cache_data.clear()
         # 실행 결과/편집 상태도 같이 초기화
         for k in list(st.session_state.keys()):
-            if k.startswith(("annual_result", "monthly_result", "exec_annual_", "exec_monthly_", "monthly_file_sig")):
+            if k.startswith(
+                (
+                    "annual_result",
+                    "monthly_result",
+                    "exec_annual_",
+                    "exec_monthly_",
+                    "monthly_file_sig",
+                    "backtest_result",
+                )
+            ):
                 del st.session_state[k]
         st.rerun()
 
@@ -109,6 +129,32 @@ def money_input(
         return parse_money(st.session_state.get(key, ""), allow_decimal)
     except Exception:
         st.error(f"'{label}' 숫자 입력이 이상해. 예: 1,000,000 / 1000 / 1,000.50")
+        st.stop()
+
+
+# ✅ Backtest 전용(영문 에러) - 기존 money_input은 건드리지 않음
+def money_input_en(
+    label: str,
+    key: str,
+    default: float = 0.0,
+    allow_decimal: bool = False,
+) -> float:
+    if key not in st.session_state:
+        st.session_state[key] = format_money(default, allow_decimal)
+
+    def _fmt():
+        try:
+            v = parse_money(st.session_state.get(key, ""), allow_decimal)
+            st.session_state[key] = format_money(v, allow_decimal)
+        except Exception:
+            pass
+
+    st.text_input(label, key=key, on_change=_fmt)
+
+    try:
+        return parse_money(st.session_state.get(key, ""), allow_decimal)
+    except Exception:
+        st.error(f"Invalid number for '{label}'. Examples: 1,000,000 / 1000 / 1,000.50")
         st.stop()
 
 
@@ -614,7 +660,573 @@ def run_month(prev: dict, cash_usd: float):
 
 
 # ======================
-# 화면: Annual / Monthly
+# Backtest helpers (NEW)
+# ======================
+BT_FX_TICKER = "USDKRW=X"
+
+BT_BENCHMARKS = {
+    "Nasdaq 100 (QQQ) [USD]": ("QQQ", "USD"),
+    "S&P 500 (SPY) [USD]": ("SPY", "USD"),
+    "KOSPI (^KS11) [KRW]": ("^KS11", "KRW"),
+    "KOSDAQ (^KQ11) [KRW]": ("^KQ11", "KRW"),
+}
+
+
+def bt_parse_start_month(s: str) -> datetime:
+    s = (s or "").strip()
+    if len(s) != 7 or s[4] != "-":
+        raise ValueError("Start month must be YYYY-MM.")
+    y = int(s[:4])
+    m = int(s[5:7])
+    return datetime(y, m, 1)
+
+
+def bt_parse_end_date(s: str) -> datetime:
+    s = (s or "").strip()
+    if len(s) == 7 and s[4] == "-":  # YYYY-MM
+        y = int(s[:4])
+        m = int(s[5:7])
+        last_day = calendar.monthrange(y, m)[1]
+        return datetime(y, m, last_day)
+    return datetime.strptime(s, "%Y-%m-%d")
+
+
+def bt_next_trading_day(nominal: datetime, trading_index: pd.DatetimeIndex) -> pd.Timestamp:
+    ts = pd.Timestamp(nominal.date())
+    i = trading_index.searchsorted(ts, side="left")
+    if i >= len(trading_index):
+        raise RuntimeError(f"Could not find next trading day for {nominal.date()}.")
+    return trading_index[i]
+
+
+def bt_last_trading_day_on_or_before(d: datetime, trading_index: pd.DatetimeIndex) -> pd.Timestamp:
+    ts = pd.Timestamp(d.date())
+    i = trading_index.searchsorted(ts, side="right") - 1
+    if i < 0:
+        raise RuntimeError(f"Could not find previous trading day for {d.date()}.")
+    return trading_index[i]
+
+
+def bt_month_10th_schedule(start_month: datetime, end_date: datetime):
+    cur = start_month.replace(day=10)
+    while cur <= end_date:
+        yield cur
+        cur = (pd.Timestamp(cur) + pd.DateOffset(months=1)).to_pydatetime()
+
+
+def bt_is_annual_rebalance(month_idx: int) -> bool:
+    return (month_idx % 12) == 0
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def bt_download_adj_close(tickers: tuple, start_str: str, end_str: str) -> pd.DataFrame:
+    start = datetime.strptime(start_str, "%Y-%m-%d")
+    end = datetime.strptime(end_str, "%Y-%m-%d")
+
+    df = yf.download(
+        list(tickers),
+        start=start.strftime("%Y-%m-%d"),
+        end=(end + timedelta(days=1)).strftime("%Y-%m-%d"),
+        auto_adjust=False,
+        progress=False,
+        group_by="ticker",
+        threads=True,
+    )
+    if df is None or df.empty:
+        raise RuntimeError("yfinance download returned empty data.")
+
+    out = {}
+    if isinstance(df.columns, pd.MultiIndex):
+        lv0 = set(df.columns.get_level_values(0))
+        lv1 = set(df.columns.get_level_values(1))
+
+        # case A: (TICKER, FIELD)
+        if set(tickers).issubset(lv0):
+            for t in tickers:
+                if (t, "Adj Close") in df.columns:
+                    out[t] = df[(t, "Adj Close")]
+                elif (t, "Close") in df.columns:
+                    out[t] = df[(t, "Close")]
+        # case B: (FIELD, TICKER)
+        elif set(tickers).issubset(lv1):
+            for t in tickers:
+                try:
+                    sub = df.xs(t, axis=1, level=1, drop_level=True)
+                    if "Adj Close" in sub.columns:
+                        out[t] = sub["Adj Close"]
+                    elif "Close" in sub.columns:
+                        out[t] = sub["Close"]
+                except Exception:
+                    pass
+        else:
+            # fallback: try best-effort extraction
+            for t in tickers:
+                try:
+                    sub = df.xs(t, axis=1, level=0, drop_level=True)
+                    if "Adj Close" in sub.columns:
+                        out[t] = sub["Adj Close"]
+                    elif "Close" in sub.columns:
+                        out[t] = sub["Close"]
+                except Exception:
+                    continue
+    else:
+        # single ticker fallback
+        col = "Adj Close" if "Adj Close" in df.columns else "Close"
+        out[list(tickers)[0]] = df[col]
+
+    adj = pd.DataFrame(out)
+    adj.index = pd.to_datetime(adj.index)
+    try:
+        if getattr(adj.index, "tz", None) is not None:
+            adj.index = adj.index.tz_localize(None)
+    except Exception:
+        pass
+
+    adj = adj.sort_index()
+    return adj
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def bt_unrate_series(start_str: str, end_str: str) -> pd.Series:
+    start = datetime.strptime(start_str, "%Y-%m-%d")
+    end = datetime.strptime(end_str, "%Y-%m-%d")
+
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=UNRATE"
+    df = pd.read_csv(url)
+    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+    df["UNRATE"] = pd.to_numeric(df["UNRATE"], errors="coerce")
+    df = df.dropna(subset=["DATE", "UNRATE"])
+
+    df = df[(df["DATE"] >= (start - timedelta(days=30))) & (df["DATE"] <= (end + timedelta(days=30)))].copy()
+    s = df.set_index("DATE")["UNRATE"]
+    s.index = pd.to_datetime(s.index)
+    try:
+        if getattr(s.index, "tz", None) is not None:
+            s.index = s.index.tz_localize(None)
+    except Exception:
+        pass
+    s = s.sort_index()
+    return s
+
+
+def bt_px_on_or_before(prices_ff: pd.DataFrame, asof: pd.Timestamp, t: str) -> float:
+    if t not in prices_ff.columns:
+        return float("nan")
+    if asof not in prices_ff.index:
+        idx = prices_ff.index.searchsorted(asof, side="right") - 1
+        if idx < 0:
+            return float("nan")
+        asof = prices_ff.index[idx]
+    return float(prices_ff.at[asof, t])
+
+
+def bt_momentum_score(asof: pd.Timestamp, prices_ff: pd.DataFrame, t: str) -> float:
+    try:
+        p = bt_px_on_or_before(prices_ff, asof, t)
+
+        def p_at(days_back: int) -> float:
+            target = asof - pd.Timedelta(days=days_back)
+            idx = prices_ff.index.searchsorted(target, side="right") - 1
+            if idx < 0:
+                return float("nan")
+            dt = prices_ff.index[idx]
+            return bt_px_on_or_before(prices_ff, dt, t)
+
+        p1 = p_at(30)
+        p3 = p_at(90)
+        p6 = p_at(180)
+        p12 = p_at(365)
+
+        if any(math.isnan(x) or x <= 0 for x in [p, p1, p3, p6, p12]):
+            return -9999.0
+
+        return (p / p1 - 1) * 12 + (p / p3 - 1) * 4 + (p / p6 - 1) * 2 + (p / p12 - 1) * 1
+    except Exception:
+        return -9999.0
+
+
+def bt_buy_all_in_if_affordable(asset: str, budget_usd: float, price: float):
+    if budget_usd < price or price <= 0 or math.isnan(price):
+        return {}, float(budget_usd)
+    q = int(budget_usd // price)
+    cash = float(budget_usd - q * price)
+    return {asset: q}, cash
+
+
+def bt_buy_equal_split_min_cash(assets: list, budget_usd: float, px_map: dict):
+    total_hold = {a: 0 for a in assets}
+    cash = float(budget_usd)
+
+    def one_round(cash_in: float):
+        n = len(assets)
+        each = cash_in / n
+        hold = {a: 0 for a in assets}
+        spent = 0.0
+        for a in assets:
+            p = float(px_map[a])
+            q = int(each // p) if p > 0 else 0
+            hold[a] += q
+            spent += q * p
+        return hold, float(cash_in - spent)
+
+    while True:
+        rh, new_cash = one_round(cash)
+        bought_any = any(q > 0 for q in rh.values())
+        for a, q in rh.items():
+            total_hold[a] += q
+        cash = float(new_cash)
+
+        if not bought_any:
+            break
+        if cash < min(float(px_map[a]) for a in assets):
+            break
+
+    cheapest = min(assets, key=lambda a: float(px_map[a]))
+    if cash >= float(px_map[cheapest]):
+        q = int(cash // float(px_map[cheapest]))
+        total_hold[cheapest] += q
+        cash = float(cash - q * float(px_map[cheapest]))
+
+    total_hold = {a: int(q) for a, q in total_hold.items() if int(q) != 0}
+    return total_hold, float(cash)
+
+
+def bt_safe_laa_asset(asof: pd.Timestamp, prices_ff: pd.DataFrame, unrate: pd.Series):
+    try:
+        unrate_now = float(unrate.loc[:asof].iloc[-1])
+        tail12 = unrate.loc[:asof].tail(12)
+        if len(tail12) < 12:
+            return "QQQ"
+        unrate_ma = float(tail12.mean())
+
+        spy_series = prices_ff["SPY"].dropna()
+        spy_tail = spy_series.loc[:asof].tail(200)
+        if len(spy_tail) < 200:
+            return "QQQ"
+
+        spy_200ma = float(spy_tail.mean())
+        spy_px = float(spy_series.loc[:asof].iloc[-1])
+
+        return "SHY" if (unrate_now > unrate_ma and spy_px < spy_200ma) else "QQQ"
+    except Exception:
+        return "QQQ"
+
+
+def bt_odm_choice(asof: pd.Timestamp, prices_ff: pd.DataFrame):
+    def r12(t: str) -> float:
+        p = bt_px_on_or_before(prices_ff, asof, t)
+        target = asof - pd.Timedelta(days=365)
+        idx = prices_ff.index.searchsorted(target, side="right") - 1
+        if idx < 0:
+            return -9999.0
+        dt = prices_ff.index[idx]
+        p0 = bt_px_on_or_before(prices_ff, dt, t)
+        if p0 <= 0 or math.isnan(p0) or math.isnan(p):
+            return -9999.0
+        return p / p0 - 1
+
+    bil_r = r12("BIL")
+    spy_r = r12("SPY")
+    efa_r = r12("EFA")
+
+    if bil_r > spy_r:
+        return "AGG"
+    return "SPY" if spy_r >= efa_r else "EFA"
+
+
+def bt_compute_twr_cagr(port_events: list, start_date: pd.Timestamp, end_date: pd.Timestamp) -> float:
+    if len(port_events) < 2:
+        return 0.0
+
+    first_post = port_events[0][2]
+    if first_post is None or first_post <= 0:
+        return 0.0
+
+    years = (end_date - start_date).days / 365.25
+    if years <= 0:
+        return 0.0
+
+    twr = 1.0
+    prev_post = first_post
+
+    for i in range(1, len(port_events)):
+        pre_i = port_events[i][1]
+        if pre_i is None or prev_post <= 0:
+            continue
+        twr *= (pre_i / prev_post)
+
+        post_i = port_events[i][2]
+        if post_i is not None:
+            prev_post = post_i
+
+    return (twr ** (1 / years) - 1) * 100
+
+
+def bt_simulate_benchmark_events(
+    ticker: str,
+    ccy: str,  # "USD" or "KRW"
+    rebalance_dates,
+    eval_asof,
+    bench_ff: pd.DataFrame,
+    fx_series: pd.Series,
+    initial_total_usd: float,
+    monthly_add_krw: float,
+    monthly_add_usd: float,
+    fractional=True,
+):
+    shares = 0.0
+    cash = 0.0  # USD or KRW
+    events = []
+
+    def value_usd(asof: pd.Timestamp) -> float:
+        fx_asof = float(fx_series.loc[:asof].iloc[-1])
+        price = bt_px_on_or_before(bench_ff, asof, ticker)
+        if ccy == "USD":
+            return float(shares * price + cash)
+        v_krw = shares * price + cash
+        return float(v_krw / fx_asof)
+
+    for m_idx, asof in enumerate(rebalance_dates):
+        fx_asof = float(fx_series.loc[:asof].iloc[-1])
+        price = bt_px_on_or_before(bench_ff, asof, ticker)
+        if math.isnan(price) or price <= 0:
+            raise RuntimeError(f"No benchmark price for {ticker} at {asof.date()}.")
+
+        pre = value_usd(asof)
+
+        if m_idx == 0:
+            add_usd = float(initial_total_usd)
+        else:
+            add_usd = float(monthly_add_usd + (monthly_add_krw / fx_asof))
+
+        add_ccy = add_usd if ccy == "USD" else add_usd * fx_asof
+
+        if fractional:
+            shares += add_ccy / price
+        else:
+            cash += add_ccy
+            q = int(cash // price)
+            shares += q
+            cash -= q * price
+
+        post = value_usd(asof)
+        events.append((asof, float(pre), float(post)))
+
+    end_value = value_usd(eval_asof)
+    events.append((eval_asof, float(end_value), None))
+    return events
+
+
+def bt_run_backtest(
+    start_month_ym: str,
+    end_date_in: str,
+    initial_krw: float,
+    initial_usd: float,
+    monthly_add_krw: float,
+    monthly_add_usd: float,
+    bench_label: str,
+):
+    start_month = bt_parse_start_month(start_month_ym)
+    end_date = bt_parse_end_date(end_date_in)
+
+    data_start = start_month - timedelta(days=900)
+    data_end = end_date + timedelta(days=10)
+
+    bench_ticker, bench_ccy = BT_BENCHMARKS[bench_label]
+    all_tickers = sorted(set(TICKER_LIST + [BT_FX_TICKER, bench_ticker]))
+
+    prices_all = bt_download_adj_close(
+        tickers=tuple(all_tickers),
+        start_str=data_start.strftime("%Y-%m-%d"),
+        end_str=data_end.strftime("%Y-%m-%d"),
+    )
+
+    if BT_FX_TICKER not in prices_all.columns:
+        raise RuntimeError("Missing USDKRW=X data.")
+    fx = prices_all[BT_FX_TICKER].dropna()
+
+    prices_raw = prices_all[[t for t in TICKER_LIST if t in prices_all.columns]].copy()
+    if prices_raw.empty:
+        raise RuntimeError("ETF price data is empty.")
+
+    cal_ticker = "SPY" if "SPY" in prices_raw.columns else prices_raw.columns[0]
+    trading_index = prices_raw[cal_ticker].dropna().index
+
+    prices_ff = prices_raw.reindex(trading_index).ffill()
+
+    # benchmark series
+    if bench_ticker not in prices_all.columns:
+        raise RuntimeError("Missing benchmark price data.")
+    bench_raw = prices_all[[bench_ticker]].copy()
+    bench_ff = bench_raw.reindex(trading_index).ffill()
+
+    # UNRATE(FRED) via CSV
+    unrate = bt_unrate_series(
+        start_str=data_start.strftime("%Y-%m-%d"),
+        end_str=data_end.strftime("%Y-%m-%d"),
+    )
+
+    nominal_dates = list(bt_month_10th_schedule(start_month, end_date))
+    rebalance_dates = [bt_next_trading_day(nd, trading_index) for nd in nominal_dates]
+    if not rebalance_dates:
+        raise RuntimeError("No rebalance dates in the given range.")
+
+    start_asof = rebalance_dates[0]
+    fx0 = float(fx.loc[:start_asof].iloc[-1])
+    initial_total_usd = float(initial_usd + (initial_krw / fx0))
+
+    state = {
+        "VAA": {"holdings": {}, "cash": 0.0},
+        "LAA": {"holdings": {}, "cash": 0.0},
+        "ODM": {"holdings": {}, "cash": 0.0},
+    }
+
+    def value_of(holdings: dict, asof: pd.Timestamp) -> float:
+        if not holdings:
+            return 0.0
+        return sum(int(q) * bt_px_on_or_before(prices_ff, asof, t) for t, q in holdings.items())
+
+    def total_value(asof: pd.Timestamp) -> float:
+        return sum(value_of(state[k]["holdings"], asof) + float(state[k]["cash"]) for k in state.keys())
+
+    def rebalance_one_date(asof: pd.Timestamp, annual: bool, add_total_usd: float):
+        px_map = {t: bt_px_on_or_before(prices_ff, asof, t) for t in TICKER_LIST}
+
+        if annual:
+            total_after = total_value(asof) + float(add_total_usd)
+            budgets = {k: total_after / 3.0 for k in ["VAA", "LAA", "ODM"]}
+        else:
+            add_each = float(add_total_usd) / 3.0
+            budgets = {}
+            for k in ["VAA", "LAA", "ODM"]:
+                budgets[k] = value_of(state[k]["holdings"], asof) + float(state[k]["cash"]) + add_each
+
+        # VAA: pick best among VAA_UNIVERSE (7 tickers, same as webapp)
+        scores = {t: bt_momentum_score(asof, prices_ff, t) for t in VAA_UNIVERSE}
+        best_vaa = max(scores, key=scores.get)
+        vaa_hold, vaa_cash = bt_buy_all_in_if_affordable(best_vaa, budgets["VAA"], px_map[best_vaa])
+
+        # LAA
+        laa_safe = bt_safe_laa_asset(asof, prices_ff, unrate)
+        laa_assets = ["IWD", "IEF", "GLD", laa_safe]
+        laa_hold, laa_cash = bt_buy_equal_split_min_cash(laa_assets, budgets["LAA"], px_map)
+
+        # ODM
+        odm_asset = bt_odm_choice(asof, prices_ff)
+        odm_hold, odm_cash = bt_buy_all_in_if_affordable(odm_asset, budgets["ODM"], px_map[odm_asset])
+
+        state["VAA"] = {"holdings": vaa_hold, "cash": vaa_cash, "picked": best_vaa}
+        state["LAA"] = {"holdings": laa_hold, "cash": laa_cash, "safe": laa_safe}
+        state["ODM"] = {"holdings": odm_hold, "cash": odm_cash, "picked": odm_asset}
+
+        return scores  # optional
+
+    logs = []
+    port_events = []  # (date, pre_value_usd, post_value_usd)
+
+    for m_idx, asof in enumerate(rebalance_dates):
+        fx_asof = float(fx.loc[:asof].iloc[-1])
+
+        pre_value = total_value(asof)
+
+        if m_idx == 0:
+            add_total_usd = float(initial_total_usd)
+        else:
+            add_total_usd = float(monthly_add_usd + (monthly_add_krw / fx_asof))
+
+        annual = bt_is_annual_rebalance(m_idx)
+        rebalance_one_date(asof, annual=annual, add_total_usd=add_total_usd)
+
+        post_value = total_value(asof)
+
+        port_events.append((asof, float(pre_value), float(post_value)))
+
+        logs.append(
+            {
+                "asof": asof,
+                "month_idx": m_idx,
+                "annual": annual,
+                "fx": fx_asof,
+                "total_usd": post_value,
+                "total_krw": post_value * fx_asof,
+                "VAA_picked": state["VAA"].get("picked"),
+                "LAA_safe": state["LAA"].get("safe"),
+                "ODM_picked": state["ODM"].get("picked"),
+            }
+        )
+
+    eval_asof = bt_last_trading_day_on_or_before(end_date, trading_index)
+    fx_end = float(fx.loc[:eval_asof].iloc[-1])
+    final_usd = total_value(eval_asof)
+    final_krw = final_usd * fx_end
+
+    port_events.append((eval_asof, float(final_usd), None))
+
+    # total invested (USD)
+    total_added_usd = 0.0
+    for row in logs:
+        if int(row["month_idx"]) == 0:
+            continue
+        fx_row = float(row["fx"])
+        total_added_usd += float(monthly_add_usd + (monthly_add_krw / fx_row))
+    total_invested_usd = float(initial_total_usd + total_added_usd)
+
+    ret_total = (final_usd / total_invested_usd - 1) * 100 if total_invested_usd > 0 else 0.0
+    port_cagr = bt_compute_twr_cagr(port_events=port_events, start_date=rebalance_dates[0], end_date=eval_asof)
+
+    df_log = pd.DataFrame(logs)
+
+    # benchmark
+    bench_events = bt_simulate_benchmark_events(
+        ticker=bench_ticker,
+        ccy=bench_ccy,
+        rebalance_dates=list(df_log["asof"]),
+        eval_asof=eval_asof,
+        bench_ff=bench_ff,
+        fx_series=fx,
+        initial_total_usd=float(initial_total_usd),
+        monthly_add_krw=float(monthly_add_krw),
+        monthly_add_usd=float(monthly_add_usd),
+        fractional=True,
+    )
+    bench_final_usd = float(bench_events[-1][1])
+    bench_ret = (bench_final_usd / total_invested_usd - 1) * 100 if total_invested_usd > 0 else 0.0
+    bench_cagr = bt_compute_twr_cagr(port_events=bench_events, start_date=rebalance_dates[0], end_date=eval_asof)
+
+    # series for chart (rebalance post values + end value)
+    port_points = [(row["asof"], float(row["total_usd"])) for _, row in df_log.iterrows()]
+    port_points.append((eval_asof, float(final_usd)))
+    port_series = pd.Series([v for _, v in port_points], index=pd.to_datetime([d for d, _ in port_points]))
+
+    bench_points = [(d, post) for (d, _, post) in bench_events[:-1]]
+    bench_points.append((bench_events[-1][0], bench_events[-1][1]))
+    bench_series = pd.Series([v for _, v in bench_points], index=pd.to_datetime([d for d, _ in bench_points]))
+
+    return {
+        "start_rebalance_asof": rebalance_dates[0],
+        "end_eval_asof": eval_asof,
+        "initial_usd": float(initial_total_usd),
+        "total_invested_usd": float(total_invested_usd),
+        "final_usd": float(final_usd),
+        "final_krw": float(final_krw),
+        "return_pct_vs_total_invested": float(ret_total),
+        "cagr_twr_pct": float(port_cagr),
+        "benchmark": {
+            "label": bench_label,
+            "ticker": bench_ticker,
+            "ccy": bench_ccy,
+            "final_usd": float(bench_final_usd),
+            "return_pct_vs_total_invested": float(bench_ret),
+            "cagr_twr_pct": float(bench_cagr),
+        },
+        "log": df_log,
+        "port_series": port_series,
+        "bench_series": bench_series,
+    }
+
+
+# ======================
+# 화면: Annual / Monthly / Backtest
 # ======================
 if mode == "Annual":
     st.header("Annual Rebalancing")
@@ -664,7 +1276,7 @@ if mode == "Annual":
             use_container_width=True,
         )
 
-else:
+elif mode == "Monthly":
     st.header("Monthly Rebalancing")
 
     uploaded = st.file_uploader("File Upload", type=["json"])
@@ -736,6 +1348,149 @@ else:
             label="✅ File Download",
             data=json.dumps(payload, indent=2),
             file_name=f"rebalance_exec_{result['timestamp'].replace(':','-').replace(' ','_')}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+else:
+    # ======================
+    # Backtest UI (NEW, English only)
+    # ======================
+    st.header("Backtest")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        bt_start_ym = st.text_input("Start month (YYYY-MM)", value=st.session_state.get("bt_start_ym", "2000-01"), key="bt_start_ym")
+    with c2:
+        bt_end_in = st.text_input(
+            "End date (YYYY-MM-DD or YYYY-MM)",
+            value=st.session_state.get("bt_end_in", today.strftime("%Y-%m-%d")),
+            key="bt_end_in",
+        )
+    with c3:
+        bt_bench = st.selectbox(
+            "Benchmark",
+            options=list(BT_BENCHMARKS.keys()),
+            index=list(BT_BENCHMARKS.keys()).index(st.session_state.get("bt_bench", "S&P 500 (SPY) [USD]"))
+            if st.session_state.get("bt_bench", "S&P 500 (SPY) [USD]") in BT_BENCHMARKS
+            else 1,
+            key="bt_bench",
+        )
+    with c4:
+        bt_fractional = st.selectbox("Benchmark fractional shares", options=["Yes", "No"], index=0, key="bt_fractional")
+
+    r1, r2, r3, r4 = st.columns(4)
+    with r1:
+        bt_initial_krw = money_input_en("Initial KRW", key="bt_initial_krw", default=0, allow_decimal=False)
+    with r2:
+        bt_initial_usd = money_input_en("Initial USD", key="bt_initial_usd", default=0, allow_decimal=True)
+    with r3:
+        bt_add_krw = money_input_en("Monthly add KRW", key="bt_add_krw", default=0, allow_decimal=False)
+    with r4:
+        bt_add_usd = money_input_en("Monthly add USD", key="bt_add_usd", default=0, allow_decimal=True)
+
+    run_bt = st.button("Run Backtest", type="primary", use_container_width=True)
+
+    if run_bt:
+        try:
+            with st.spinner("Running backtest..."):
+                out = bt_run_backtest(
+                    start_month_ym=bt_start_ym,
+                    end_date_in=bt_end_in,
+                    initial_krw=float(bt_initial_krw),
+                    initial_usd=float(bt_initial_usd),
+                    monthly_add_krw=float(bt_add_krw),
+                    monthly_add_usd=float(bt_add_usd),
+                    bench_label=bt_bench,
+                )
+            st.session_state["backtest_result"] = out
+            st.success("Completed")
+        except Exception as e:
+            st.error(str(e))
+
+    if "backtest_result" in st.session_state:
+        out = st.session_state["backtest_result"]
+        bench = out["benchmark"]
+
+        a, b, c, d = st.columns(4)
+        a.metric("Start rebalance (asof)", str(pd.to_datetime(out["start_rebalance_asof"]).date()))
+        b.metric("End eval (asof)", str(pd.to_datetime(out["end_eval_asof"]).date()))
+        c.metric("Total invested (USD)", f"${out['total_invested_usd']:,.2f}")
+        d.metric("Final (USD)", f"${out['final_usd']:,.2f}")
+
+        e, f, g, h = st.columns(4)
+        e.metric("Final (KRW)", f"₩{out['final_krw']:,.0f}")
+        f.metric("Return vs invested", f"{out['return_pct_vs_total_invested']:.2f}%")
+        g.metric("CAGR (TWR)", f"{out['cagr_twr_pct']:.2f}%")
+        h.metric("Benchmark CAGR (TWR)", f"{bench['cagr_twr_pct']:.2f}%")
+
+        # Chart: normalized compare
+        port_series = out["port_series"].copy()
+        bench_series = out["bench_series"].copy()
+
+        df_chart = pd.concat(
+            [port_series.rename("PORT"), bench_series.rename("BENCH")],
+            axis=1,
+        ).dropna()
+        if not df_chart.empty:
+            df_chart = df_chart / df_chart.iloc[0]
+            df_chart = df_chart.reset_index().rename(columns={"index": "Date"})
+            df_melt = df_chart.melt(id_vars=["Date"], value_vars=["PORT", "BENCH"], var_name="Series", value_name="Value")
+
+            chart = (
+                alt.Chart(df_melt)
+                .mark_line()
+                .encode(
+                    x=alt.X("Date:T"),
+                    y=alt.Y("Value:Q"),
+                    color=alt.Color("Series:N"),
+                    tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("Series:N"), alt.Tooltip("Value:Q", format=".4f")],
+                )
+                .properties(height=360)
+            )
+            st.altair_chart(chart, use_container_width=True)
+
+        # Logs
+        df_log = out["log"].copy()
+        with st.expander("Log (last 6)", expanded=True):
+            show = df_log.tail(6).copy()
+            show["asof"] = pd.to_datetime(show["asof"]).dt.date.astype(str)
+            show["total_usd"] = show["total_usd"].map(lambda x: f"{x:,.2f}")
+            show["total_krw"] = show["total_krw"].map(lambda x: f"{x:,.0f}")
+            st.dataframe(
+                show[["asof", "annual", "total_usd", "total_krw", "VAA_picked", "LAA_safe", "ODM_picked"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with st.expander("Log (full)", expanded=False):
+            tmp = df_log.copy()
+            tmp["asof"] = pd.to_datetime(tmp["asof"])
+            st.dataframe(tmp, use_container_width=True, hide_index=True)
+
+        # Downloads
+        st.download_button(
+            "Download log (CSV)",
+            data=df_log.to_csv(index=False).encode("utf-8"),
+            file_name="backtest_log.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+        summary_payload = {
+            "start_rebalance_asof": str(pd.to_datetime(out["start_rebalance_asof"]).date()),
+            "end_eval_asof": str(pd.to_datetime(out["end_eval_asof"]).date()),
+            "total_invested_usd": out["total_invested_usd"],
+            "final_usd": out["final_usd"],
+            "final_krw": out["final_krw"],
+            "return_pct_vs_total_invested": out["return_pct_vs_total_invested"],
+            "cagr_twr_pct": out["cagr_twr_pct"],
+            "benchmark": out["benchmark"],
+        }
+        st.download_button(
+            "Download summary (JSON)",
+            data=json.dumps(summary_payload, indent=2),
+            file_name="backtest_summary.json",
             mime="application/json",
             use_container_width=True,
         )
