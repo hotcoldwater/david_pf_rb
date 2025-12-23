@@ -25,7 +25,7 @@ INPUT_TICKERS = [t for t in TICKER_LIST if t != "BIL"]
 VAA_UNIVERSE = ["SPY", "EFA", "EEM", "AGG", "LQD", "IEF", "SHY"]
 
 st.set_page_config(page_title="Rebalance (Private)", layout="wide")
-st.title("PORTFOLIO")
+st.title("PORTFOLIO 이선우 ㅂㅅ")
 
 
 # ======================
