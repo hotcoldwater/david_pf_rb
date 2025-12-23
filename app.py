@@ -663,7 +663,7 @@ if mode == "Annual":
         payload = export_holdings_only(executed, timestamp=result["timestamp"])
 
         st.download_button(
-            label="✅ 파일 다운로드",
+            label="✅ File Download",
             data=json.dumps(payload, indent=2),
             file_name=f"rebalance_exec_{result['timestamp'].replace(':','-').replace(' ','_')}.json",
             mime="application/json",
@@ -701,8 +701,9 @@ else:
 
     prev = json.loads(json.dumps(prev_raw))  # deep copy
 
+    # ✅ FIX: money_input에는 label이 필수
     st.subheader("현금($)")
-    cash_usd = money_input(key="m_cash_usd", default=0, allow_decimal=True)
+    cash_usd = money_input("현금($)", key="m_cash_usd", default=0, allow_decimal=True)
 
     # 이전 실행본 요약(선택)
     with st.expander("Previous", expanded=False):
@@ -739,7 +740,7 @@ else:
         payload = export_holdings_only(executed, timestamp=result["timestamp"])
 
         st.download_button(
-            label="✅ 실행본(ETF만) 다운로드",
+            label="✅ File Download",
             data=json.dumps(payload, indent=2),
             file_name=f"rebalance_exec_{result['timestamp'].replace(':','-').replace(' ','_')}.json",
             mime="application/json",
